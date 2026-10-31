@@ -1,78 +1,140 @@
 //! grove: a multi-agent coding agent with a fast terminal UI.
+//!
+//! Sessions run in a background server (`grove server`, started on demand) so they
+//! outlive the terminal; `grove` itself is a UI that attaches to them.
 
 mod agent;
 mod api;
+mod client;
 mod config;
 mod hub;
 mod infer;
 mod mcp;
 mod prompts;
 mod protocol;
+mod server;
 mod store;
 mod tools;
 mod tui;
 mod watchers;
+mod wire;
 
 use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::sync::mpsc;
 
 use config::Config;
-use hub::Hub;
-use protocol::{Effort, Input, Level, Role};
+use protocol::Effort;
 use store::Store;
+use wire::{Reply, Request};
 
-const USAGE: &str = "usage: grove [options] [prompt]
+const USAGE: &str = "usage:
+  grove                     the session list (start new sessions from its prompt box)
+  grove <prompt>            start a session with this prompt and open it
+  grove --bg <prompt>       start a session in the background; prints its id
+  grove -c, --continue      open the latest session in this directory
+  grove -r, --resume <id>   open a session (also: grove attach <id>)
+  grove list [--json]       list sessions (also: grove agents)
+  grove stop <id>           stop a session's agents (it stays resumable)
+  grove rm <id>             stop and delete a session
+  grove shutdown            stop the background server (sessions stay resumable)
 
-  -c, --continue        resume the latest session in this directory
-  -r, --resume <id>     resume a session by id
-      --effort <level>  low | medium | high | xhigh | max (default high)
-      --model <id>      model id (default claude-opus-5-5)
-  -h, --help
+options: --effort low|medium|high|xhigh|max   --model <id>
 
+Sessions run in a background server, so they keep going when you close the terminal.
 environment: ANTHROPIC_API_KEY (or keychain item grove-anthropic-api-key),
 GROVE_SUPERVISOR / GROVE_MEMORY / GROVE_IMPROVER = 0 to turn a watcher off,
 GROVE_THEME = light | dark, GROVE_SRC, GROVE_HOME, MEMORY_URL";
 
-struct Args {
-    resume: Option<String>,
-    continue_latest: bool,
-    prompt: Option<String>,
+enum Command {
+    Ui(tui::Start),
+    Background(String),
+    List { json: bool },
+    Stop(String),
+    Delete(String),
+    Shutdown,
+    Server { resume: Vec<String> },
 }
 
-fn parse_args(config: &mut Config) -> Result<Args> {
-    let mut args = Args {
-        resume: None,
-        continue_latest: false,
-        prompt: None,
-    };
+fn parse_args(config: &mut Config) -> Result<Command> {
     let mut words = Vec::new();
-    let mut it = std::env::args().skip(1);
-    while let Some(arg) = it.next() {
+    let mut resume = None;
+    let mut cont = false;
+    let mut bg = false;
+    let mut json = false;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let in_server = words.first().map(String::as_str) == Some("server");
         match arg.as_str() {
+            _ if in_server => words.push(arg),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
             }
-            "-c" | "--continue" => args.continue_latest = true,
-            "-r" | "--resume" => {
-                args.resume = Some(it.next().context("--resume needs a session id")?)
-            }
+            "-c" | "--continue" => cont = true,
+            "-r" | "--resume" => resume = Some(args.next().context("--resume needs a session id")?),
+            "--bg" => bg = true,
+            "--json" => json = true,
             "--effort" => {
-                let e = it.next().context("--effort needs a level")?;
+                let e = args.next().context("--effort needs a level")?;
                 config.effort = Effort::parse(&e).with_context(|| format!("unknown effort {e}"))?;
             }
-            "--model" => config.model = it.next().context("--model needs a model id")?,
+            "--model" => config.model = args.next().context("--model needs a model id")?,
             other if other.starts_with('-') => bail!("unknown option {other}\n\n{USAGE}"),
             other => words.push(other.to_string()),
         }
     }
-    if !words.is_empty() {
-        args.prompt = Some(words.join(" "));
+    let arg1 = || words.get(1).cloned();
+    // A first word that names a command is never a prompt.
+    match words.first().map(String::as_str) {
+        Some("server") => {
+            let mut ids = Vec::new();
+            let mut take = false;
+            for w in &words[1..] {
+                if w == "--resume" {
+                    take = true;
+                } else if take {
+                    ids.push(w.clone());
+                }
+            }
+            return Ok(Command::Server { resume: ids });
+        }
+        Some("list") | Some("agents") => return Ok(Command::List { json }),
+        Some("attach") => {
+            let id = arg1().context("attach needs a session id")?;
+            return Ok(Command::Ui(tui::Start::Attach(id)));
+        }
+        Some("stop") => return Ok(Command::Stop(arg1().context("stop needs a session id")?)),
+        Some("rm") => return Ok(Command::Delete(arg1().context("rm needs a session id")?)),
+        Some("shutdown") => return Ok(Command::Shutdown),
+        Some("help") => {
+            println!("{USAGE}");
+            std::process::exit(0);
+        }
+        _ => {}
     }
-    Ok(args)
+    if let Some(id) = resume {
+        return Ok(Command::Ui(tui::Start::Attach(id)));
+    }
+    if cont {
+        let cwd = std::env::current_dir()?;
+        let id = Store::latest_for(&config.home, &cwd)
+            .context("no earlier session in this directory")?;
+        return Ok(Command::Ui(tui::Start::Attach(id)));
+    }
+    if words.is_empty() {
+        if bg {
+            bail!("--bg needs a prompt");
+        }
+        return Ok(Command::Ui(tui::Start::List));
+    }
+    let prompt = words.join(" ");
+    if bg {
+        return Ok(Command::Background(prompt));
+    }
+    Ok(Command::Ui(tui::Start::New(prompt)))
 }
 
 #[tokio::main]
@@ -91,90 +153,121 @@ async fn main() -> ExitCode {
     }
 }
 
+fn effort_override(config: &Config) -> Option<Effort> {
+    if config.effort == config::DEFAULT_EFFORT {
+        None
+    } else {
+        Some(config.effort)
+    }
+}
+
 async fn run() -> Result<()> {
     let mut config = Config::load();
-    let args = parse_args(&mut config)?;
+    let command = parse_args(&mut config)?;
+    let home = config.home.clone();
     let cwd = std::env::current_dir()?;
-
-    let resume_id = match (&args.resume, args.continue_latest) {
-        (Some(id), _) => Some(id.clone()),
-        (None, true) => Some(
-            Store::latest_for(&config.home, &cwd)
-                .context("no earlier session in this directory")?,
-        ),
-        _ => None,
-    };
-    let store = match &resume_id {
-        Some(id) => Store::open(&config.home, id)?,
-        None => Store::create(&config.home, &cwd)?,
-    };
-    let theme = if config.light_theme {
-        tui::Theme::light()
-    } else {
-        tui::Theme::dark()
-    };
-
-    let client = api::Client::new(config::api_key());
-    let (ui_tx, ui_rx) = mpsc::unbounded_channel();
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let hub = Hub::new(config.clone(), store.clone(), client.clone(), ui_tx, cmd_tx);
-
-    // Restore saved agents (watchers are started by their module), or start fresh.
-    let mut restored_watchers = Vec::new();
-    if resume_id.is_some() {
-        for (meta, history) in store.load_agents()? {
-            if meta.role.is_watcher() {
-                restored_watchers.push((meta, history));
-                continue;
+    match command {
+        Command::Server { resume } => server::run(config, resume).await,
+        Command::List { json } => {
+            let reply = client::request(&home, true, Request::Hello, |r| {
+                matches!(r, Reply::Sessions { .. })
+            })
+            .await?;
+            let Reply::Sessions { list } = reply else {
+                unreachable!()
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+                return Ok(());
             }
-            let tools = hub.tools_for(meta.role);
-            hub.start(meta, history, tools);
-        }
-    }
-    let main_id = match hub.find_role(Role::Main) {
-        Some(id) => id,
-        None => {
-            let meta = hub.new_meta(
-                Role::Main,
-                "main",
-                None,
-                config.effort,
-                &store.session.cwd,
-                "",
-            );
-            let tools = hub.tools_for(Role::Main);
-            hub.start(meta, Vec::new(), tools)
-        }
-    };
-    watchers::start(&hub, restored_watchers);
-
-    if !client.has_key() {
-        hub.notify(
-            &main_id,
-            Level::Alert,
-            "No Anthropic API key. Set ANTHROPIC_API_KEY, or store one in the keychain:\n  security add-generic-password -s grove-anthropic-api-key -a grove -w",
-        );
-    }
-    if let Some(prompt) = args.prompt {
-        hub.send(&main_id, Input::User(prompt))?;
-    }
-
-    match tui::run(hub, ui_rx, cmd_rx, theme).await? {
-        tui::Exit::Quit => {
-            println!(
-                "grove session {} — resume with: grove --resume {}",
-                store.session.id, store.session.id
-            );
+            if list.is_empty() {
+                println!("no sessions");
+            }
+            for s in &list {
+                let state = if s.busy {
+                    "busy"
+                } else if s.live {
+                    "idle"
+                } else {
+                    "stopped"
+                };
+                let title = s.title.clone().unwrap_or_else(|| "(no prompt yet)".into());
+                println!("{}  {state:<7}  {}  {}", s.id, s.cwd.display(), title);
+            }
             Ok(())
         }
-        tui::Exit::Exec { binary, session } => {
-            // Replace this process; the terminal stays in fullscreen mode across the swap.
-            let err = std::process::Command::new(&binary)
-                .args(["--resume", &session])
-                .env("GROVE_UPGRADED", "1")
-                .exec();
-            tui::restore_terminal();
-            Err(err).with_context(|| format!("exec {}", binary.display()))
+        Command::Background(prompt) => {
+            let req = Request::Create {
+                cwd,
+                prompt: Some(prompt),
+                model: Some(config.model.clone()),
+                effort: effort_override(&config),
+                attach: false,
+            };
+            let reply =
+                client::request(&home, true, req, |r| matches!(r, Reply::Created { .. })).await?;
+            let Reply::Created { session } = reply else {
+                unreachable!()
+            };
+            println!("{session}");
+            Ok(())
+        }
+        Command::Stop(session) => {
+            client::request(&home, true, Request::Stop { session }, |r| {
+                matches!(r, Reply::Info { .. })
+            })
+            .await?;
+            Ok(())
+        }
+        Command::Delete(session) => {
+            client::request(&home, true, Request::Delete { session }, |r| {
+                matches!(r, Reply::Info { .. })
+            })
+            .await?;
+            Ok(())
+        }
+        Command::Shutdown => {
+            match client::connect(&home, false, Duration::from_millis(200)).await {
+                Ok((remote, mut rx)) => {
+                    remote.send(Request::Shutdown);
+                    // The server pauses its sessions, then exits; wait for it to go.
+                    while let Some(m) = rx.recv().await {
+                        if matches!(m, client::Incoming::Disconnected) {
+                            break;
+                        }
+                    }
+                    println!("grove server stopped");
+                }
+                Err(_) => println!("no grove server running"),
+            }
+            Ok(())
+        }
+        Command::Ui(start) => {
+            let theme = if config.light_theme {
+                tui::Theme::light()
+            } else {
+                tui::Theme::dark()
+            };
+            // After an upgrade the server is restarting: wait for it rather than race it.
+            let upgraded = std::env::var_os("GROVE_UPGRADED").is_some();
+            let wait = if upgraded {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_secs(5)
+            };
+            let (remote, rx) = client::connect(&home, !upgraded, wait).await?;
+            match tui::run(remote, rx, theme, home, cwd, start).await? {
+                tui::Exit::Quit => Ok(()),
+                tui::Exit::Exec { binary, session } => {
+                    let mut cmd = std::process::Command::new(&binary);
+                    if let Some(id) = &session {
+                        cmd.args(["attach", id]);
+                    }
+                    let err = cmd.env("GROVE_UPGRADED", "1").exec();
+                    tui::restore_terminal();
+                    Err(err).with_context(|| format!("exec {}", binary.display()))
+                }
+            }
         }
     }
 }

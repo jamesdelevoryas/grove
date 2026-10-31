@@ -39,14 +39,26 @@ use tokio::time::Instant;
 
 pub use theme::Theme;
 
+use crate::client::{self, Incoming, Remote};
 use crate::config;
-use crate::hub::Hub;
-use crate::protocol::{Event, Input, UiCommand};
+use crate::wire::Request;
 use app::{Action, App};
 
 pub enum Exit {
     Quit,
-    Exec { binary: PathBuf, session: String },
+    /// The server restarted into a new build: exec it, reattaching to `session`.
+    Exec {
+        binary: PathBuf,
+        session: Option<String>,
+    },
+}
+
+/// What the UI opens on.
+pub enum Start {
+    List,
+    Attach(String),
+    /// A new session in the UI's directory, with this first prompt.
+    New(String),
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -138,13 +150,26 @@ fn restore(enhanced: bool) {
 }
 
 pub async fn run(
-    hub: Hub,
-    mut events: mpsc::UnboundedReceiver<Event>,
-    mut commands: mpsc::UnboundedReceiver<UiCommand>,
+    remote: Remote,
+    mut incoming: mpsc::UnboundedReceiver<Incoming>,
     theme: Theme,
+    home: PathBuf,
+    cwd: PathBuf,
+    start: Start,
 ) -> Result<Exit> {
     let (mut term, mut guard) = setup()?;
-    let mut app = App::new(hub.clone(), theme);
+    let mut app = App::new(remote, theme, home.clone(), cwd.clone());
+    match start {
+        Start::List => {}
+        Start::Attach(id) => app.enter_session(&id),
+        Start::New(prompt) => app.remote.send(Request::Create {
+            cwd,
+            prompt: Some(prompt),
+            model: None,
+            effort: None,
+            attach: true,
+        }),
+    }
     let mut input = EventStream::new();
     let mut dirty = true;
     let mut urgent = true;
@@ -166,6 +191,10 @@ pub async fn run(
         }
         if app.quit {
             break Exit::Quit;
+        }
+        if let Some(binary) = app.exec.take() {
+            let session = app.session.as_ref().map(|s| s.id.clone());
+            break Exit::Exec { binary, session };
         }
         let next_frame = last_draw + frame;
         let waiting = dirty && !frozen;
@@ -193,16 +222,36 @@ pub async fn run(
                 dirty = true;
                 urgent = true;
             }
-            Some(cmd) = commands.recv() => match cmd {
-                UiCommand::Exec { binary, session } => break Exit::Exec { binary, session },
-            },
-            Some(ev) = events.recv() => {
-                app.on_event(ev);
-                // Drain the backlog so a burst of deltas costs one frame.
-                while let Ok(ev) = events.try_recv() {
-                    app.on_event(ev);
+            msg = incoming.recv() => {
+                let mut batch = Vec::new();
+                match msg {
+                    Some(m) => batch.push(m),
+                    None => batch.push(Incoming::Disconnected),
                 }
-                // The frozen view is a snapshot: agent activity doesn't touch it.
+                // Drain the backlog so a burst of deltas costs one frame.
+                while let Ok(m) = incoming.try_recv() {
+                    batch.push(m);
+                }
+                for m in batch {
+                    match m {
+                        Incoming::Reply(reply) => app.on_reply(reply),
+                        Incoming::Disconnected => {
+                            if app.exec.is_some() {
+                                break;
+                            }
+                            app.toast(crate::protocol::Level::Warn, "lost the grove server; reconnecting…");
+                            draw(&mut term, &mut app)?;
+                            let (r, rx) = client::connect(&home, true, Duration::from_secs(10)).await?;
+                            app.remote = r;
+                            incoming = rx;
+                            if let Some(info) = app.session.clone() {
+                                app.enter_session(&info.id);
+                            }
+                            break;
+                        }
+                    }
+                }
+                // The frozen view is a snapshot: activity doesn't touch it.
                 if !frozen {
                     dirty = true;
                 }
@@ -221,21 +270,7 @@ pub async fn run(
         }
     };
 
-    if matches!(exit, Exit::Quit) {
-        // Interrupt running work so no tool process outlives grove.
-        for v in &app.views {
-            if v.status.busy() {
-                let _ = hub.send(&v.meta.id, Input::Interrupt);
-            }
-        }
-        for _ in 0..80 {
-            if !hub.any_busy() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        // The guard restores the terminal as it drops.
-    } else {
+    if matches!(exit, Exit::Exec { .. }) {
         // Hand the terminal over still in the alternate screen (no flash), but in cooked
         // mode: the new process records the mode it finds as the one to restore on exit.
         guard.armed = false;
@@ -244,6 +279,8 @@ pub async fn run(
         }
         let _ = crossterm::terminal::disable_raw_mode();
     }
+    // Quitting the UI leaves every session running in the server; the guard restores
+    // the terminal as it drops.
     Ok(exit)
 }
 

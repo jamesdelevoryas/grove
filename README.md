@@ -6,8 +6,18 @@ Default model `claude-opus-5-5` at effort `high`.
 ```sh
 cargo build --release
 export ANTHROPIC_API_KEY=...   # or: security add-generic-password -s grove-anthropic-api-key -a grove -w
-target/release/grove [prompt]  # -c to continue the last session here, -r <id> to resume one
+grove                  # the session list; type a prompt to start a session, ↑↓ enter to open one
+grove <prompt>         # start a session and open it
+grove --bg <prompt>    # start one in the background
+grove list [--json]    # also: grove agents
+grove attach <id>      # also -r <id>; -c opens the latest session in this directory
+grove stop <id> · grove rm <id> · grove shutdown
 ```
+
+Sessions run in a background server (`grove server`, started on demand, socket
+`~/.grove/server.sock`, log `~/.grove/server.log`), so they keep running when you close
+the terminal. In the list: ↑↓ select, enter open, ctrl+x stop, del twice to delete. In a
+session: esc or ← on an empty prompt goes back to the list.
 
 ## Keys (Claude Code's, mostly)
 
@@ -28,8 +38,12 @@ Commands: `/clear /effort /model /spawn /interrupt /stop /retry /upgrade /improv
 
 ## Architecture
 
-- **Hub** (`hub.rs`): every agent's mailbox, event fan-out (to the UI, and a no-deltas
-  feed to watchers), spawning, messaging, and the upgrade sequence.
+- **Server** (`server.rs`, protocol in `wire.rs`, client in `client.rs`): owns every live
+  session's hub. Each session keeps a replay log of its UI events (streaming deltas fold
+  away when their block finishes), so a UI attaching later gets the whole transcript, then
+  the live stream. The UI (`tui/`) is only a client: it sends `Input`s and renders events.
+- **Hub** (`hub.rs`): one session's agent mailboxes, event fan-out (to the server, and a
+  no-deltas feed to watchers), spawning, messaging, pause/resume.
 - **Agents** (`agent.rs`): one loop for every role. Input that arrives mid-turn is
   queued and joins the next request (steering). Tool calls run concurrently and are
   cancellable. History is append-only JSONL and grows only when the model answers, so
@@ -43,9 +57,11 @@ Commands: `/clear /effort /model /spawn /interrupt /stop /retry /upgrade /improv
     sends useful notes to the working agent; saves durable facts.
   - *improver*: watches for friction, proposes fixes to grove itself, implements them
     on request, then `request_upgrade`.
-- **Self-upgrade** (`/upgrade`): `cargo build --release` runs while everything keeps
-  working; then every agent is paused (inference and tools cancelled, queued input
-  saved), grove `exec`s the new binary with `--resume`, and paused agents continue.
+- **Self-upgrade** (`/upgrade`): the server runs `cargo build --release` while everything
+  keeps working; then every agent of every session is paused (inference and tools
+  cancelled, queued input saved), the server `exec`s the new binary with the live session
+  ids, and paused agents continue. Attached UIs get a `restarting` message, exec the new
+  build too, and reattach.
 - **UI inference** (`infer.rs`): forks an agent's exact cached request prefix and asks one
   question at low effort. Used for the suggested next prompts after every turn.
 - **TUI** (`tui/`): redraws only when something changed, caps streaming at ~120 fps,

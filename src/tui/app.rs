@@ -11,9 +11,12 @@ use super::editor::Editor;
 use super::pager::{Pager, PagerAction};
 use super::theme::Theme;
 use super::transcript::Transcript;
-use crate::hub::Hub;
+use std::path::PathBuf;
+
+use crate::client::Remote;
 use crate::protocol::*;
-use crate::store;
+use crate::store::{self, SessionInfo};
+use crate::wire::{Reply, Request, SessionSummary};
 
 const TOAST_FOR: Duration = Duration::from_secs(6);
 
@@ -33,8 +36,18 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/agents", "toggle the agents panel"),
     ("/focus", "<agent> — switch to an agent"),
     ("/cost", "token usage and cost"),
-    ("/quit", "exit grove"),
+    ("/sessions", "back to the session list"),
+    ("/rm", "delete the highlighted session (list)"),
+    ("/quit", "exit grove (sessions keep running)"),
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    /// Every session, with a prompt box that starts new ones.
+    List,
+    /// Inside one session.
+    Session,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -80,10 +93,24 @@ pub struct Hit {
     pub transcript: Rect,
     /// Entry index for each transcript row on screen.
     pub rows: Vec<Option<usize>>,
+    /// Screen row → index into the session list.
+    pub list_rows: Vec<(u16, usize)>,
 }
 
 pub struct App {
-    pub hub: Hub,
+    pub remote: Remote,
+    pub home: PathBuf,
+    /// Where new sessions start.
+    pub cwd: PathBuf,
+    pub screen: Screen,
+    /// The attached session.
+    pub session: Option<SessionInfo>,
+    pub sessions: Vec<SessionSummary>,
+    pub list_sel: usize,
+    pub proposal: Option<String>,
+    /// Set when the server restarts into a new build: the UI execs it too.
+    pub exec: Option<PathBuf>,
+    delete_armed: Option<(String, Instant)>,
     pub theme: Theme,
     pub views: Vec<AgentView>,
     pub focus: usize,
@@ -109,10 +136,19 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(hub: Hub, theme: Theme) -> Self {
-        let history = store::load_history(&hub.store().history_path());
+    pub fn new(remote: Remote, theme: Theme, home: PathBuf, cwd: PathBuf) -> Self {
+        let history = store::load_history(&home.join("history"));
         Self {
-            hub,
+            remote,
+            home,
+            cwd,
+            screen: Screen::List,
+            session: None,
+            sessions: Vec::new(),
+            list_sel: 0,
+            proposal: None,
+            exec: None,
+            delete_armed: None,
             theme,
             views: Vec::new(),
             focus: 0,
@@ -134,6 +170,144 @@ impl App {
             pager: None,
             screen_width: 100,
         }
+    }
+
+    /// Sends input to an agent of the attached session.
+    fn input(&self, agent: &str, input: Input) -> anyhow::Result<()> {
+        let Some(info) = &self.session else {
+            anyhow::bail!("not in a session");
+        };
+        self.remote.send(Request::Input {
+            session: info.id.clone(),
+            agent: agent.to_string(),
+            input,
+        });
+        Ok(())
+    }
+
+    fn find_role(&self, role: Role) -> Option<AgentId> {
+        for v in &self.views {
+            if v.meta.role == role {
+                return Some(v.meta.id.clone());
+            }
+        }
+        None
+    }
+
+    pub fn on_reply(&mut self, reply: Reply) {
+        match reply {
+            Reply::Hello { build, .. } => {
+                if build != crate::wire::build_id() {
+                    self.toast(
+                        Level::Warn,
+                        "the grove server is running a different build; /upgrade restarts it",
+                    );
+                }
+            }
+            Reply::Sessions { list } => {
+                self.sessions = list;
+                if self.list_sel >= self.sessions.len() {
+                    self.list_sel = self.sessions.len().saturating_sub(1);
+                }
+            }
+            Reply::Created { session } => {
+                if self.screen == Screen::List {
+                    self.toast(Level::Info, format!("started session {session}"));
+                }
+            }
+            Reply::Attached { info } => {
+                self.views.clear();
+                self.focus = 0;
+                self.session = Some(info);
+                self.screen = Screen::Session;
+                self.mode = Mode::Input;
+                self.pager = None;
+                self.suggestion_next = 0;
+            }
+            Reply::Event { session, event } => {
+                if self.session.as_ref().is_some_and(|s| s.id == session) {
+                    self.on_event(event);
+                }
+            }
+            Reply::Proposal { summary } => self.proposal = summary,
+            Reply::Error { message } => self.toast(Level::Alert, message),
+            Reply::Info { message } => self.toast(Level::Info, message),
+            Reply::Restarting { binary } => self.exec = Some(binary),
+        }
+    }
+
+    pub fn enter_session(&mut self, id: &str) {
+        self.remote.send(Request::Attach {
+            session: id.to_string(),
+        });
+    }
+
+    pub fn leave_session(&mut self) {
+        self.remote.send(Request::Detach);
+        // Keep the list's cursor on the session we just left.
+        if let Some(info) = &self.session
+            && let Some(i) = self.sessions.iter().position(|s| s.id == info.id)
+        {
+            self.list_sel = i;
+        }
+        self.session = None;
+        self.views.clear();
+        self.screen = Screen::List;
+        self.mode = Mode::Input;
+        self.pager = None;
+    }
+
+    fn selected_session(&self) -> Option<String> {
+        self.sessions.get(self.list_sel).map(|s| s.id.clone())
+    }
+
+    fn list_key(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let empty = self.editor.is_empty();
+        let n = self.sessions.len();
+        match key.code {
+            KeyCode::Char('c') if ctrl => self.ctrl_c(),
+            KeyCode::Char('d') if ctrl && empty => self.arm_quit(),
+            KeyCode::Char('l') if ctrl => return Action::Redraw,
+            KeyCode::Up if empty && n > 0 => self.list_sel = self.list_sel.saturating_sub(1),
+            KeyCode::Char('p') if ctrl && n > 0 => self.list_sel = self.list_sel.saturating_sub(1),
+            KeyCode::Down if empty && n > 0 => self.list_sel = (self.list_sel + 1).min(n - 1),
+            KeyCode::Char('n') if ctrl && n > 0 => self.list_sel = (self.list_sel + 1).min(n - 1),
+            KeyCode::Home if empty => self.list_sel = 0,
+            KeyCode::End if empty => self.list_sel = n.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Right if empty && !alt && !shift => {
+                if let Some(id) = self.selected_session() {
+                    self.enter_session(&id);
+                }
+            }
+            KeyCode::Char('x') if ctrl => {
+                if let Some(id) = self.selected_session() {
+                    self.remote.send(Request::Stop { session: id });
+                }
+            }
+            KeyCode::Delete if empty => self.delete_selected(),
+            _ => self.input_key(key, ctrl, alt, shift),
+        }
+        Action::None
+    }
+
+    /// Deletes the highlighted session; asks for a second press first.
+    fn delete_selected(&mut self) {
+        let Some(id) = self.selected_session() else {
+            return;
+        };
+        if let Some((armed, at)) = &self.delete_armed
+            && *armed == id
+            && at.elapsed() < Duration::from_secs(3)
+        {
+            self.delete_armed = None;
+            self.remote.send(Request::Delete { session: id });
+            return;
+        }
+        self.delete_armed = Some((id.clone(), Instant::now()));
+        self.toast(Level::Warn, format!("delete {id}? press again to confirm"));
     }
 
     /// Freezes the focused transcript into a pager at full width.
@@ -312,6 +486,9 @@ impl App {
                 PagerAction::None => Action::None,
             };
         }
+        if self.screen == Screen::List {
+            return self.list_key(key);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -399,7 +576,7 @@ impl App {
         }
         if self.focused().is_some_and(|v| v.status.busy()) {
             let id = self.focused_id();
-            let _ = self.hub.send(&id, Input::Interrupt);
+            let _ = self.input(&id, Input::Interrupt);
             return;
         }
         self.arm_quit();
@@ -413,7 +590,10 @@ impl App {
             return;
         }
         self.quit_armed = Some(Instant::now());
-        self.toast(Level::Info, "press ctrl+c again to exit");
+        self.toast(
+            Level::Info,
+            "press ctrl+c again to exit (sessions keep running)",
+        );
     }
 
     fn cycle_focus(&mut self, delta: isize) {
@@ -441,7 +621,7 @@ impl App {
         let Some(view) = self.focused() else { return };
         let next = view.meta.effort.next();
         let id = view.meta.id.clone();
-        let _ = self.hub.send(&id, Input::SetEffort(next));
+        let _ = self.input(&id, Input::SetEffort(next));
         self.toast(Level::Info, format!("{id}: effort {}", next.as_str()));
     }
 
@@ -503,10 +683,24 @@ impl App {
             KeyCode::Enter if alt || shift => self.editor.insert_char('\n'),
             KeyCode::Char('j') if ctrl => self.editor.insert_char('\n'),
             KeyCode::Enter => self.submit(),
+            KeyCode::Left
+                if self.screen == Screen::Session && self.editor.is_empty() && !alt && !ctrl =>
+            {
+                self.leave_session()
+            }
+            KeyCode::Esc
+                if self.screen == Screen::Session
+                    && self.editor.is_empty()
+                    && !self
+                        .focused()
+                        .is_some_and(|v| v.status.busy() || v.scroll > 0) =>
+            {
+                self.leave_session()
+            }
             KeyCode::Esc => {
                 if self.focused().is_some_and(|v| v.status.busy()) {
                     let id = self.focused_id();
-                    let _ = self.hub.send(&id, Input::Interrupt);
+                    let _ = self.input(&id, Input::Interrupt);
                 } else if let Some(v) = self.focused_mut() {
                     v.scroll = 0;
                 }
@@ -608,17 +802,27 @@ impl App {
         self.menu_sel = 0;
         if self.history.last() != Some(&text) {
             self.history.push(text.clone());
-            store::append_history(&self.hub.store().history_path(), &text);
+            store::append_history(&self.home.join("history"), &text);
         }
         if text.starts_with('/') {
             self.command(&text);
+            return;
+        }
+        if self.screen == Screen::List {
+            self.remote.send(Request::Create {
+                cwd: self.cwd.clone(),
+                prompt: Some(text),
+                model: None,
+                effort: None,
+                attach: false,
+            });
             return;
         }
         let id = self.focused_id();
         if let Some(v) = self.focused_mut() {
             v.scroll = 0;
         }
-        if let Err(e) = self.hub.send(&id, Input::User(text)) {
+        if let Err(e) = self.input(&id, Input::User(text)) {
             self.toast(Level::Alert, format!("{e:#}"));
         }
     }
@@ -638,11 +842,27 @@ impl App {
                 self.quit = true;
                 Ok(())
             }
-            "/clear" => self.hub.send(&id, Input::Clear),
+            "/sessions" => {
+                if self.screen == Screen::Session {
+                    self.leave_session();
+                }
+                Ok(())
+            }
+            "/rm" if self.screen == Screen::List => {
+                self.delete_selected();
+                Ok(())
+            }
+            "/stop" if self.screen == Screen::List => {
+                if let Some(session) = self.selected_session() {
+                    self.remote.send(Request::Stop { session });
+                }
+                Ok(())
+            }
+            "/clear" => self.input(&id, Input::Clear),
             "/effort" => match Effort::parse(arg) {
                 Some(e) => {
                     self.toast(Level::Info, format!("{id}: effort {}", e.as_str()));
-                    self.hub.send(&id, Input::SetEffort(e))
+                    self.input(&id, Input::SetEffort(e))
                 }
                 None => {
                     self.toast(Level::Warn, "effort: low, medium, high, xhigh, or max");
@@ -659,34 +879,35 @@ impl App {
                     Ok(())
                 } else {
                     self.toast(Level::Info, format!("{id}: model {arg}"));
-                    self.hub.send(&id, Input::SetModel(arg.to_string()))
+                    self.input(&id, Input::SetModel(arg.to_string()))
                 }
             }
             "/spawn" => match arg.split_once(char::is_whitespace) {
-                Some((name, task)) => {
-                    let cwd = self.hub.store().session.cwd.clone();
-                    match self.hub.spawn_sub(&id, name, task.trim(), None, &cwd) {
-                        Ok(sub) => {
-                            self.toast(Level::Info, format!("started {sub}"));
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
+                Some((name, task)) => match &self.session {
+                    Some(info) => {
+                        self.remote.send(Request::Spawn {
+                            session: info.id.clone(),
+                            parent: id.clone(),
+                            name: name.to_string(),
+                            task: task.trim().to_string(),
+                        });
+                        self.toast(Level::Info, format!("starting {name}"));
+                        Ok(())
                     }
-                }
+                    None => Err(anyhow::anyhow!("not in a session")),
+                },
                 None => {
                     self.toast(Level::Warn, "usage: /spawn <name> <task>");
                     Ok(())
                 }
             },
-            "/interrupt" => self
-                .hub
-                .send(if arg.is_empty() { &id } else { arg }, Input::Interrupt),
-            "/stop" => self
-                .hub
-                .send(if arg.is_empty() { &id } else { arg }, Input::Stop),
-            "/retry" => self.hub.send(&id, Input::Retry),
+            "/interrupt" => self.input(if arg.is_empty() { &id } else { arg }, Input::Interrupt),
+            "/stop" => self.input(if arg.is_empty() { &id } else { arg }, Input::Stop),
+            "/retry" => self.input(&id, Input::Retry),
             "/upgrade" => {
-                self.hub.upgrade(&id);
+                self.remote.send(Request::Upgrade {
+                    session: self.session.as_ref().map(|s| s.id.clone()),
+                });
                 Ok(())
             }
             "/improve" | "/memory" | "/supervisor" => {
@@ -695,7 +916,7 @@ impl App {
                     "/memory" => Role::Memory,
                     _ => Role::Supervisor,
                 };
-                match self.hub.find_role(role) {
+                match self.find_role(role) {
                     Some(target) => {
                         if arg.is_empty() {
                             if let Some(i) = self.views.iter().position(|v| v.meta.id == target) {
@@ -704,7 +925,7 @@ impl App {
                             Ok(())
                         } else {
                             self.toast(Level::Info, format!("sent to {target}"));
-                            self.hub.send(&target, Input::User(arg.to_string()))
+                            self.input(&target, Input::User(arg.to_string()))
                         }
                     }
                     None => {
@@ -829,6 +1050,23 @@ impl App {
         match ev.kind {
             MouseEventKind::ScrollUp => self.scroll_by(3),
             MouseEventKind::ScrollDown => self.scroll_by(-3),
+            MouseEventKind::Down(MouseButton::Left) if self.screen == Screen::List => {
+                let mut target = None;
+                for (row, i) in &self.hit.list_rows {
+                    if *row == ev.row {
+                        target = Some(*i);
+                    }
+                }
+                if let Some(i) = target {
+                    // A click on the highlighted row opens it.
+                    if i == self.list_sel
+                        && let Some(id) = self.selected_session()
+                    {
+                        self.enter_session(&id);
+                    }
+                    self.list_sel = i;
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if inside(self.hit.sidebar) {
                     let mut target = None;

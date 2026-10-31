@@ -131,6 +131,10 @@ impl Agent {
             self.turn().await;
         }
         loop {
+            // An Exit that arrived mid-turn ends the task once the turn has wound down.
+            if self.abort == Some(Abort::Closed) {
+                break;
+            }
             if self.paused {
                 self.hub.set_status(&id, Status::Paused);
             } else if self.meta.stopped {
@@ -264,6 +268,7 @@ impl Agent {
                 self.save_meta();
             }
             Input::Retry => self.wake = true,
+            Input::Exit => self.abort = Some(Abort::Closed),
         }
     }
 

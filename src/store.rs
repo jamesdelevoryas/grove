@@ -22,6 +22,9 @@ pub struct SessionInfo {
     pub id: String,
     pub cwd: PathBuf,
     pub created: chrono::DateTime<chrono::Local>,
+    /// The first prompt, as a name for the session list.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Clone)]
@@ -42,6 +45,7 @@ impl Store {
             id,
             cwd: cwd.to_path_buf(),
             created: now,
+            title: None,
         };
         let store = Self {
             home: home.to_path_buf(),
@@ -63,25 +67,46 @@ impl Store {
         })
     }
 
-    /// The newest session started in `cwd`.
-    pub fn latest_for(home: &Path, cwd: &Path) -> Option<String> {
-        let mut best: Option<SessionInfo> = None;
-        for entry in fs::read_dir(home.join("sessions")).ok()? {
+    /// Every session on disk, newest first.
+    pub fn list_all(home: &Path) -> Vec<SessionInfo> {
+        let mut out = Vec::new();
+        let Ok(dir) = fs::read_dir(home.join("sessions")) else {
+            return out;
+        };
+        for entry in dir {
             let Ok(entry) = entry else { continue };
             let Ok(text) = fs::read_to_string(entry.path().join("session.json")) else {
                 continue;
             };
-            let Ok(info) = serde_json::from_str::<SessionInfo>(&text) else {
-                continue;
-            };
-            if info.cwd != cwd {
-                continue;
-            }
-            if best.as_ref().is_none_or(|b| info.created > b.created) {
-                best = Some(info);
+            if let Ok(info) = serde_json::from_str::<SessionInfo>(&text) {
+                out.push(info);
             }
         }
-        best.map(|b| b.id)
+        out.sort_by_key(|s| std::cmp::Reverse(s.created));
+        out
+    }
+
+    /// The newest session started in `cwd`.
+    pub fn latest_for(home: &Path, cwd: &Path) -> Option<String> {
+        for info in Self::list_all(home) {
+            if info.cwd == cwd {
+                return Some(info.id);
+            }
+        }
+        None
+    }
+
+    pub fn save_info(&self) -> Result<()> {
+        write_json(&self.session_dir().join("session.json"), &self.session)
+    }
+
+    /// Deletes a session's directory.
+    pub fn delete(home: &Path, id: &str) -> Result<()> {
+        if id.is_empty() || id.contains('/') || id.contains("..") {
+            anyhow::bail!("bad session id {id:?}");
+        }
+        let dir = home.join("sessions").join(id);
+        fs::remove_dir_all(&dir).with_context(|| format!("deleting {}", dir.display()))
     }
 
     pub fn session_dir(&self) -> PathBuf {
@@ -143,10 +168,6 @@ impl Store {
         let path = dir.join("messages.jsonl");
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(MessageLog { path, file })
-    }
-
-    pub fn history_path(&self) -> PathBuf {
-        self.home.join("history")
     }
 }
 

@@ -29,19 +29,12 @@ struct Inner {
     store: Store,
     config: Config,
     memory: RwLock<Option<Arc<Mcp>>>,
-    upgrade: Mutex<UpgradeState>,
 }
 
 struct Handle {
     meta: AgentMeta,
     tx: mpsc::UnboundedSender<Input>,
     status: Status,
-}
-
-#[derive(Default)]
-struct UpgradeState {
-    proposal: Option<String>,
-    running: bool,
 }
 
 impl Hub {
@@ -61,7 +54,6 @@ impl Hub {
             store,
             config,
             memory: RwLock::new(None),
-            upgrade: Mutex::new(UpgradeState::default()),
         }))
     }
 
@@ -97,6 +89,15 @@ impl Hub {
         let (tx, rx) = mpsc::unbounded_channel();
         self.0.observers.lock().unwrap().push(tx);
         rx
+    }
+
+    /// Ends every agent task and watcher feed, so an unloaded session lets go of
+    /// everything. Interrupt or pause first if work should be cut short cleanly.
+    pub fn close(&self) {
+        for id in self.ids() {
+            let _ = self.send(&id, Input::Exit);
+        }
+        self.0.observers.lock().unwrap().clear();
     }
 
     pub fn notify(&self, agent: &str, level: Level, text: &str) {
@@ -388,105 +389,58 @@ impl Hub {
     // ---- self-upgrade ----
 
     pub fn request_upgrade(&self, from: &str, summary: &str) {
-        self.0.upgrade.lock().unwrap().proposal = Some(summary.to_string());
         self.notify(
             from,
             Level::Alert,
             &format!("upgrade ready: {summary} — run /upgrade to rebuild and restart"),
         );
-    }
-
-    pub fn upgrade_proposal(&self) -> Option<String> {
-        self.0.upgrade.lock().unwrap().proposal.clone()
-    }
-
-    /// Builds grove from its source tree while everything keeps running; only once that
-    /// succeeds are the agents paused (cancelling inference and tool calls, saving queued
-    /// input) and the UI told to exec the new binary, which resumes them.
-    pub fn upgrade(&self, reporter: &str) {
-        {
-            let mut state = self.0.upgrade.lock().unwrap();
-            if state.running {
-                self.notify(reporter, Level::Warn, "an upgrade is already running");
-                return;
-            }
-            state.running = true;
-        }
-        let hub = self.clone();
-        let reporter = reporter.to_string();
-        tokio::spawn(async move {
-            let result = hub.build_and_pause(&reporter).await;
-            hub.0.upgrade.lock().unwrap().running = false;
-            if let Err(e) = result {
-                hub.notify(&reporter, Level::Alert, &format!("upgrade failed: {e:#}"));
-            }
+        let _ = self.0.ui_cmd.send(UiCommand::Proposal {
+            summary: summary.to_string(),
         });
     }
 
-    async fn build_and_pause(&self, reporter: &str) -> Result<()> {
-        let src = self.0.config.src.clone();
-        self.notify(
-            reporter,
-            Level::Info,
-            &format!("building grove in {} …", src.display()),
-        );
-        let out = tokio::process::Command::new("cargo")
-            .args(["build", "--release", "--quiet"])
-            .current_dir(&src)
-            .output()
-            .await?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let tail: Vec<&str> = err
-                .lines()
-                .rev()
-                .take(30)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            bail!("cargo build failed:\n{}", tail.join("\n"));
+    pub fn ids(&self) -> Vec<AgentId> {
+        let agents = self.0.agents.lock().unwrap();
+        let mut ids = Vec::new();
+        for h in agents.iter() {
+            ids.push(h.meta.id.clone());
         }
-        let binary = src.join("target/release/grove");
-        if !binary.exists() {
-            bail!("build succeeded but {} is missing", binary.display());
-        }
-        self.notify(
-            reporter,
-            Level::Info,
-            "build ok — pausing agents to restart",
-        );
-        let ids: Vec<AgentId> = {
-            let agents = self.0.agents.lock().unwrap();
-            let mut ids = Vec::new();
-            for h in agents.iter() {
-                ids.push(h.meta.id.clone());
-            }
-            ids
-        };
+        ids
+    }
+
+    /// Pauses every agent (cancelling inference and tool calls, saving queued input) and
+    /// waits until each reports Paused. Returns false, with everyone resumed, on timeout.
+    pub async fn pause_all(&self) -> bool {
+        let ids = self.ids();
         for id in &ids {
             let _ = self.send(id, Input::Pause);
         }
-        // Each agent saves its state, then reports Paused. Wait for every one of them.
-        let mut all_paused = false;
         for _ in 0..200 {
             if self.all_paused(&ids) {
-                all_paused = true;
-                break;
+                return true;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        if !all_paused {
-            for id in &ids {
-                let _ = self.send(id, Input::Resume);
-            }
-            bail!("agents didn't pause within 5s; resumed them, not restarting");
+        self.resume_all();
+        false
+    }
+
+    pub fn resume_all(&self) {
+        for id in self.ids() {
+            let _ = self.send(&id, Input::Resume);
         }
-        self.0.upgrade.lock().unwrap().proposal = None;
-        let _ = self.0.ui_cmd.send(UiCommand::Exec {
-            binary,
-            session: self.0.store.session.id.clone(),
-        });
-        Ok(())
+    }
+
+    /// Interrupts all running work and waits briefly for it to stop.
+    pub async fn interrupt_all(&self) {
+        for id in self.ids() {
+            let _ = self.send(&id, Input::Interrupt);
+        }
+        for _ in 0..80 {
+            if !self.any_busy() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }

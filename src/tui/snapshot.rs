@@ -10,10 +10,12 @@ use super::Theme;
 use super::app::App;
 use super::view;
 use crate::api;
+use crate::client::Remote;
 use crate::config::Config;
 use crate::hub::Hub;
 use crate::protocol::*;
 use crate::store::Store;
+use crate::wire::{Reply, SessionSummary};
 
 fn meta(hub: &Hub, role: Role, name: &str, parent: Option<&str>) -> AgentMeta {
     hub.new_meta(
@@ -48,8 +50,17 @@ async fn renders_a_session() {
     let store = Store::create(&dir, std::path::Path::new("/Users/peterd/code/grove")).unwrap();
     let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
     let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-    let hub = Hub::new(config, store, api::Client::new(None), ui_tx, cmd_tx);
-    let mut app = App::new(hub.clone(), Theme::dark());
+    let hub = Hub::new(config, store.clone(), api::Client::new(None), ui_tx, cmd_tx);
+    let (remote, _requests) = Remote::detached();
+    let mut app = App::new(
+        remote,
+        Theme::dark(),
+        dir.clone(),
+        "/Users/peterd/code/grove".into(),
+    );
+    let mut info = store.session.clone();
+    info.title = Some("Make the parser handle trailing commas".into());
+    app.on_reply(Reply::Attached { info });
     let ev = |agent: &str, kind: EventKind| Event {
         agent: agent.into(),
         kind,
@@ -160,5 +171,63 @@ async fn renders_a_session() {
     assert!(frozen.contains("VISUAL"));
     app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
     assert!(app.pager.is_none());
+
+    // Back to the session list.
+    app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let now = chrono::Local::now();
+    let row = |id: &str,
+               title: Option<&str>,
+               live: bool,
+               busy: bool,
+               agents: usize,
+               cost: f64,
+               mins: i64| SessionSummary {
+        id: id.into(),
+        cwd: "/Users/peterd/code/grove".into(),
+        created: now - chrono::Duration::minutes(mins),
+        title: title.map(String::from),
+        live,
+        busy,
+        agents,
+        cost,
+        updated: now - chrono::Duration::minutes(mins),
+    };
+    app.on_reply(Reply::Sessions {
+        list: vec![
+            row(
+                "20261031-160102-1a2b",
+                Some("Make the parser handle trailing commas, and run the tests"),
+                true,
+                true,
+                5,
+                0.45,
+                0,
+            ),
+            row(
+                "20261031-151500-3c4d",
+                Some("Profile the TUI render loop under a 10k-line transcript"),
+                true,
+                false,
+                4,
+                1.12,
+                12,
+            ),
+            row(
+                "20261031-145859-2e76",
+                Some("how does the grove multiplexing work?"),
+                false,
+                false,
+                0,
+                0.0,
+                70,
+            ),
+        ],
+    });
+    app.toast = None;
+    let list = screen(&mut app, 120, 16);
+    println!("{list}");
+    assert!(list.contains("SESSIONS"));
+    assert!(list.contains("Profile the TUI render loop"));
+    assert!(list.contains("Start a new session in ~/code/grove"));
     let _ = std::fs::remove_dir_all(dir);
 }

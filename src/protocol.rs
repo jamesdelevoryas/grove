@@ -123,7 +123,7 @@ impl UsageTotals {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Status {
     Idle,
     /// Waiting on the model.
@@ -142,7 +142,7 @@ impl Status {
 }
 
 /// What can be sent to an agent.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Input {
     /// A prompt from the human.
     User(String),
@@ -173,22 +173,24 @@ pub enum Input {
     Retry,
     /// Undo a Pause (an upgrade that didn't happen).
     Resume,
+    /// End the agent's task (its session is being unloaded). Nothing is marked stopped.
+    Exit,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Level {
     Info,
     Warn,
     Alert,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub agent: AgentId,
     pub kind: EventKind,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum EventKind {
     Spawned(AgentMeta),
     /// The saved conversation of an agent that was just restored.
@@ -247,9 +249,9 @@ impl EventKind {
     }
 }
 
-/// Requests from the hub to the UI, which owns the terminal.
+/// Requests from a session's hub to whoever runs it (the grove server).
 #[derive(Debug)]
 pub enum UiCommand {
-    /// Replace this process with a freshly built grove, resuming the session.
-    Exec { binary: PathBuf, session: String },
+    /// The improver has an upgrade ready (the human applies it with /upgrade).
+    Proposal { summary: String },
 }
