@@ -6,11 +6,16 @@
 //! Each loaded session keeps a replay log of its UI events (streaming deltas are folded
 //! away once their block finishes), so a UI that attaches later sees the whole transcript
 //! and then the live stream.
+//!
+//! Only one server runs per ~/.grove: it holds an flock on server.lock, and hands that
+//! same lock to its successor across the exec of a self-upgrade, so nothing can start a
+//! second server in between.
 
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,9 +31,12 @@ use crate::hub::Hub;
 use crate::protocol::*;
 use crate::store::{SessionInfo, Store};
 use crate::watchers;
-use crate::wire::{Reply, Request, SOCKET, SessionSummary, build_id};
+use crate::wire::{LOCK_FD_ENV, Reply, Request, SOCKET, SessionSummary, build_id};
 
 const TITLE_CHARS: usize = 80;
+/// Lines queued for one UI before it counts as stuck and is disconnected (it reconnects
+/// and resyncs from the replay log).
+const CONN_QUEUE: usize = 50_000;
 
 pub struct Server {
     config: Config,
@@ -36,8 +44,13 @@ pub struct Server {
     state: Mutex<State>,
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
     list_changed: Notify,
+    /// Set from the moment sessions start pausing for a restart: no new work starts.
     upgrading: AtomicBool,
+    /// One upgrade (build + restart) at a time.
+    building: AtomicBool,
     build: String,
+    lock_fd: i32,
+    next_gen: AtomicU64,
 }
 
 #[derive(Default)]
@@ -49,11 +62,13 @@ struct State {
 }
 
 struct Conn {
-    tx: mpsc::UnboundedSender<Arc<String>>,
+    tx: mpsc::Sender<Arc<String>>,
     attached: Option<String>,
 }
 
 struct Live {
+    /// Distinguishes this load of the session from an earlier one with the same id.
+    generation: u64,
     hub: Hub,
     info: SessionInfo,
     /// Every event a newly attached UI needs, minus streaming deltas of finished blocks
@@ -68,34 +83,40 @@ struct Live {
     updated: chrono::DateTime<chrono::Local>,
 }
 
+/// What recording an event changed.
+#[derive(Default)]
+struct Recorded {
+    list_changed: bool,
+    /// The session got its title; session.json needs saving (outside the lock).
+    titled: Option<Store>,
+}
+
 impl Live {
-    /// Records an event; returns true if the session list changed.
-    fn record(&mut self, event: &Event) -> bool {
+    fn record(&mut self, event: &Event) -> Recorded {
         self.updated = chrono::Local::now();
         let agent = &event.agent;
+        let mut out = Recorded::default();
         match &event.kind {
             EventKind::TextDelta(_) | EventKind::ProgressDelta(_) => {
                 self.streaming
                     .entry(agent.clone())
                     .or_default()
                     .push(event.clone());
-                false
             }
             EventKind::BlockDone(_) | EventKind::ResponseDiscarded | EventKind::TurnEnd => {
                 self.streaming.remove(agent);
                 self.replay.push(event.clone());
-                false
             }
             EventKind::Status(status) => {
                 if *status == Status::Thinking {
                     self.suggestions.remove(agent);
                 }
                 self.statuses.insert(agent.clone(), status.clone());
-                true
+                out.list_changed = true;
             }
             EventKind::Meta(meta) => {
                 self.metas.insert(agent.clone(), meta.clone());
-                true
+                out.list_changed = true;
             }
             EventKind::Spawned(meta) => {
                 if !self.order.contains(agent) {
@@ -104,18 +125,19 @@ impl Live {
                 self.metas.insert(agent.clone(), meta.clone());
                 self.statuses.insert(agent.clone(), Status::Idle);
                 self.replay.push(event.clone());
-                true
+                out.list_changed = true;
             }
             EventKind::Suggestions(items) => {
                 self.suggestions.insert(agent.clone(), items.clone());
-                false
             }
+            // Watcher activity batches are bulky and only matter live; a reattaching UI
+            // still sees the watchers' replies.
+            EventKind::Feed(_) => {}
             EventKind::Cleared => {
                 self.replay
                     .retain(|e| &e.agent != agent || matches!(e.kind, EventKind::Spawned(_)));
                 self.streaming.remove(agent);
                 self.replay.push(event.clone());
-                false
             }
             EventKind::UserText(text) => {
                 self.replay.push(event.clone());
@@ -129,16 +151,13 @@ impl Live {
                     self.info.title = Some(title);
                     let mut store = self.hub.store().clone();
                     store.session = self.info.clone();
-                    let _ = store.save_info();
-                    return true;
+                    out.titled = Some(store);
+                    out.list_changed = true;
                 }
-                false
             }
-            _ => {
-                self.replay.push(event.clone());
-                false
-            }
+            _ => self.replay.push(event.clone()),
         }
+        out
     }
 
     /// What a newly attached UI is sent, in order.
@@ -199,26 +218,53 @@ fn line(reply: &Reply) -> Arc<String> {
     Arc::new(serde_json::to_string(reply).expect("reply serializes"))
 }
 
-/// Holds an exclusive lock on ~/.grove/server.lock for the life of the process (and is
-/// released at exec), so two servers can never share a socket.
+/// Queues a line for a UI; false if its queue is full (it's stuck, or gone).
+fn push(conn: &Conn, l: Arc<String>) -> bool {
+    conn.tx.try_send(l).is_ok()
+}
+
+fn set_cloexec(fd: i32, on: bool) {
+    // Safety: fcntl on a descriptor we own.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        let flags = if on {
+            flags | libc::FD_CLOEXEC
+        } else {
+            flags & !libc::FD_CLOEXEC
+        };
+        libc::fcntl(fd, libc::F_SETFD, flags);
+    }
+}
+
+/// An exclusive lock on ~/.grove/server.lock, held for the life of the process. A server
+/// exec'd by a self-upgrade inherits its predecessor's descriptor (named in the
+/// environment) and so already holds the lock.
 fn take_lock(home: &std::path::Path) -> Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
     std::fs::create_dir_all(home)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(home.join("server.lock"))?;
-    // Safety: flock on a file descriptor we own.
+    let file = match std::env::var(LOCK_FD_ENV)
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
+        // Safety: the predecessor left this descriptor open for us and nothing else
+        // in this process uses it.
+        Some(fd) => unsafe { std::fs::File::from_raw_fd(fd) },
+        None => std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(home.join("server.lock"))?,
+    };
+    // Safety: flock on a descriptor we own. Re-locking an inherited lock succeeds.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         bail!("another grove server is already running");
     }
+    set_cloexec(file.as_raw_fd(), true);
     Ok(file)
 }
 
 pub async fn run(config: Config, resume: Vec<String>) -> Result<()> {
-    let _lock = take_lock(&config.home)?;
+    let lock = take_lock(&config.home)?;
     let socket = config.home.join(SOCKET);
     let _ = std::fs::remove_file(&socket);
     let listener =
@@ -241,7 +287,10 @@ pub async fn run(config: Config, resume: Vec<String>) -> Result<()> {
         cmd_tx,
         list_changed: Notify::new(),
         upgrading: AtomicBool::new(false),
+        building: AtomicBool::new(false),
         build: build_id(),
+        lock_fd: lock.as_raw_fd(),
+        next_gen: AtomicU64::new(1),
     });
     for id in resume {
         if let Err(e) = server.load(&id) {
@@ -261,16 +310,14 @@ impl Server {
     fn send_to(&self, conn: u64, reply: &Reply) {
         let st = self.state.lock().unwrap();
         if let Some(c) = st.conns.get(&conn) {
-            let _ = c.tx.send(line(reply));
+            let _ = push(c, line(reply));
         }
     }
 
     fn broadcast(&self, reply: &Reply) {
         let l = line(reply);
-        let st = self.state.lock().unwrap();
-        for c in st.conns.values() {
-            let _ = c.tx.send(l.clone());
-        }
+        let mut st = self.state.lock().unwrap();
+        st.conns.retain(|_, c| push(c, l.clone()));
     }
 
     /// Loads a session from disk and starts its agents (no-op if it's running).
@@ -309,7 +356,6 @@ impl Server {
             config.effort = e;
         }
         let id = store.session.id.clone();
-        let saved = store.load_agents()?;
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
         let hub = Hub::new(
             config.clone(),
@@ -318,11 +364,17 @@ impl Server {
             ui_tx,
             self.cmd_tx.clone(),
         );
+        let generation = self.next_gen.fetch_add(1, Ordering::SeqCst);
         {
+            // Check and claim under one lock, so two requests can't both load a session.
             let mut st = self.state.lock().unwrap();
+            if st.live.contains_key(&id) {
+                return Ok(id);
+            }
             st.live.insert(
                 id.clone(),
                 Live {
+                    generation,
                     hub: hub.clone(),
                     info: store.session.clone(),
                     replay: Vec::new(),
@@ -335,8 +387,15 @@ impl Server {
                 },
             );
         }
-        tokio::spawn(self.clone().pump(id.clone(), ui_rx));
+        tokio::spawn(self.clone().pump(id.clone(), generation, ui_rx));
 
+        let saved = match store.load_agents() {
+            Ok(saved) => saved,
+            Err(e) => {
+                self.state.lock().unwrap().live.remove(&id);
+                return Err(e);
+            }
+        };
         let mut restored_watchers: Vec<(AgentMeta, Vec<Value>)> = Vec::new();
         for (meta, history) in saved {
             if meta.role.is_watcher() {
@@ -377,42 +436,61 @@ impl Server {
     }
 
     /// Records a session's events and forwards them to attached UIs.
-    async fn pump(self: Arc<Self>, id: String, mut rx: mpsc::UnboundedReceiver<Event>) {
+    async fn pump(
+        self: Arc<Self>,
+        id: String,
+        generation: u64,
+        mut rx: mpsc::UnboundedReceiver<Event>,
+    ) {
         while let Some(event) = rx.recv().await {
             let l = line(&Reply::Event {
                 session: id.clone(),
                 event: event.clone(),
             });
-            let changed = {
+            let recorded = {
                 let mut st = self.state.lock().unwrap();
+                // A stopped session, or a newer load of it: this pump is done.
                 let Some(live) = st.live.get_mut(&id) else {
                     break;
                 };
-                let changed = live.record(&event);
-                for c in st.conns.values() {
-                    if c.attached.as_deref() == Some(id.as_str()) {
-                        let _ = c.tx.send(l.clone());
-                    }
+                if live.generation != generation {
+                    break;
                 }
-                changed
+                let recorded = live.record(&event);
+                st.conns.retain(|_, c| {
+                    if c.attached.as_deref() == Some(id.as_str()) {
+                        push(c, l.clone())
+                    } else {
+                        true
+                    }
+                });
+                recorded
             };
-            if changed {
+            if let Some(store) = recorded.titled {
+                let _ = store.save_info();
+            }
+            if recorded.list_changed {
                 self.list_changed.notify_one();
             }
         }
     }
 
-    /// Unloads a session: interrupts its work and ends its tasks. It stays on disk.
+    /// Unloads a session: interrupts its work, ends its tasks (waiting for them), and
+    /// sends attached UIs back to the list. It stays on disk.
     async fn stop(&self, id: &str) {
         let live = self.state.lock().unwrap().live.remove(id);
         if let Some(live) = live {
             live.hub.interrupt_all().await;
-            live.hub.close();
+            live.hub.close().await;
         }
+        let l = line(&Reply::Stopped {
+            session: id.to_string(),
+        });
         let mut st = self.state.lock().unwrap();
         for c in st.conns.values_mut() {
             if c.attached.as_deref() == Some(id) {
                 c.attached = None;
+                let _ = push(c, l.clone());
             }
         }
         drop(st);
@@ -457,7 +535,7 @@ impl Server {
 
     async fn connection(self: Arc<Self>, stream: UnixStream) {
         let (rd, mut wr) = stream.into_split();
-        let (tx, mut rx) = mpsc::unbounded_channel::<Arc<String>>();
+        let (tx, mut rx) = mpsc::channel::<Arc<String>>(CONN_QUEUE);
         let conn = {
             let mut st = self.state.lock().unwrap();
             st.next_conn += 1;
@@ -471,6 +549,7 @@ impl Server {
                     break;
                 }
             }
+            // Dropping the write half closes our side; the UI reconnects and resyncs.
         });
         let mut lines = BufReader::new(rd).lines();
         while let Ok(Some(l)) = lines.next_line().await {
@@ -482,6 +561,10 @@ impl Server {
                         message: format!("bad request: {e}"),
                     },
                 ),
+            }
+            // Gone because its queue overflowed: stop reading for it too.
+            if !self.state.lock().unwrap().conns.contains_key(&conn) {
+                break;
             }
         }
         self.state.lock().unwrap().conns.remove(&conn);
@@ -502,13 +585,19 @@ impl Server {
                 event,
             }));
         }
+        lines.push(line(&Reply::Synced {
+            session: session.to_string(),
+        }));
         // Under the lock, so no live event can slip in between the snapshot and the stream.
         let Some(c) = st.conns.get_mut(&conn) else {
             return Ok(());
         };
         c.attached = Some(session.to_string());
         for l in lines {
-            let _ = c.tx.send(l);
+            if !push(c, l) {
+                st.conns.remove(&conn);
+                break;
+            }
         }
         Ok(())
     }
@@ -523,6 +612,24 @@ impl Server {
     }
 
     async fn handle(self: &Arc<Self>, conn: u64, req: Request) {
+        // While restarting, nothing new may start: it would miss the pause and the
+        // list of sessions the next server resumes.
+        let starts_work = matches!(
+            req,
+            Request::Create { .. }
+                | Request::Attach { .. }
+                | Request::Input { .. }
+                | Request::Spawn { .. }
+        );
+        if starts_work && self.upgrading.load(Ordering::SeqCst) {
+            self.send_to(
+                conn,
+                &Reply::Error {
+                    message: "grove is upgrading; try again in a moment".into(),
+                },
+            );
+            return;
+        }
         let result: Result<()> = match req {
             Request::Hello => {
                 self.send_to(
@@ -644,22 +751,24 @@ impl Server {
         }
     }
 
+    fn live_hubs(&self) -> Vec<(String, Hub)> {
+        let st = self.state.lock().unwrap();
+        let mut out = Vec::new();
+        for (id, l) in st.live.iter() {
+            out.push((id.clone(), l.hub.clone()));
+        }
+        out
+    }
+
     /// Pauses every session (mid-turn agents pick up again next time it's loaded) and
     /// exits.
     async fn shutdown(&self) {
-        let hubs: Vec<Hub> = self
-            .state
-            .lock()
-            .unwrap()
-            .live
-            .values()
-            .map(|l| l.hub.clone())
-            .collect();
-        for hub in &hubs {
+        self.upgrading.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_file(self.config.home.join(SOCKET));
+        for (_, hub) in self.live_hubs() {
             hub.pause_all().await;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let _ = std::fs::remove_file(self.config.home.join(SOCKET));
         std::process::exit(0);
     }
 
@@ -699,7 +808,7 @@ impl Server {
     /// Builds grove while everything keeps running; then pauses every session's agents,
     /// tells the UIs, and execs the new binary, which resumes the same sessions.
     async fn upgrade(self: Arc<Self>, session: Option<String>, reporter: Option<String>) {
-        if self.upgrading.swap(true, Ordering::SeqCst) {
+        if self.building.swap(true, Ordering::SeqCst) {
             self.note(
                 &session,
                 &reporter,
@@ -708,9 +817,9 @@ impl Server {
             );
             return;
         }
-        let result = self.build_and_restart(&session, &reporter).await;
-        self.upgrading.store(false, Ordering::SeqCst);
-        if let Err(e) = result {
+        if let Err(e) = self.build_and_restart(&session, &reporter).await {
+            self.upgrading.store(false, Ordering::SeqCst);
+            self.building.store(false, Ordering::SeqCst);
             self.note(
                 &session,
                 &reporter,
@@ -747,20 +856,15 @@ impl Server {
         if !binary.exists() {
             bail!("build succeeded but {} is missing", binary.display());
         }
+        // From here nothing new starts (see `handle`).
+        self.upgrading.store(true, Ordering::SeqCst);
         self.note(
             session,
             reporter,
             Level::Info,
             "build ok — pausing every session to restart",
         );
-        let live: Vec<(String, Hub)> = {
-            let st = self.state.lock().unwrap();
-            let mut out = Vec::new();
-            for (id, l) in st.live.iter() {
-                out.push((id.clone(), l.hub.clone()));
-            }
-            out
-        };
+        let live = self.live_hubs();
         let mut paused: Vec<Hub> = Vec::new();
         for (_, hub) in &live {
             if !hub.pause_all().await {
@@ -771,6 +875,9 @@ impl Server {
             }
             paused.push(hub.clone());
         }
+        // Unlink the socket first: UIs that exec the new build then wait for the next
+        // server instead of reaching this one in its last moments.
+        let _ = std::fs::remove_file(self.config.home.join(SOCKET));
         self.broadcast(&Reply::Restarting {
             binary: binary.clone(),
         });
@@ -780,11 +887,16 @@ impl Server {
         for (id, _) in &live {
             args.push(id.clone());
         }
-        let err = std::process::Command::new(&binary).args(&args).exec();
-        for h in &paused {
-            h.resume_all();
-        }
-        bail!("exec {}: {err}", binary.display())
+        // Hand the lock over: the next server inherits this descriptor, already locked.
+        set_cloexec(self.lock_fd, false);
+        let err = std::process::Command::new(&binary)
+            .args(&args)
+            .env(LOCK_FD_ENV, self.lock_fd.to_string())
+            .exec();
+        // The socket is gone and the UIs have moved on; the sessions are saved and
+        // paused, so the next server resumes them when it's started.
+        eprintln!("upgrade: exec {} failed: {err}; exiting", binary.display());
+        std::process::exit(1);
     }
 }
 
@@ -806,6 +918,7 @@ mod tests {
             cmd_tx,
         );
         let mut live = Live {
+            generation: 1,
             hub,
             info: store.session.clone(),
             replay: Vec::new(),

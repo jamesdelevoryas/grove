@@ -87,8 +87,18 @@ fn parse_args(config: &mut Config) -> Result<Command> {
         }
     }
     let arg1 = || words.get(1).cloned();
-    // A first word that names a command is never a prompt.
-    match words.first().map(String::as_str) {
+    // A command word is a command only with its exact arguments; otherwise the words are
+    // a prompt (`grove list the TODOs`).
+    let n = words.len();
+    let first = match words.first().map(String::as_str) {
+        Some("list" | "agents" | "shutdown" | "help") if n == 1 => {
+            words.first().map(String::as_str)
+        }
+        Some("attach" | "stop" | "rm") if n == 2 => words.first().map(String::as_str),
+        Some("server") => Some("server"),
+        _ => None,
+    };
+    match first {
         Some("server") => {
             let mut ids = Vec::new();
             let mut take = false;
@@ -256,7 +266,13 @@ async fn run() -> Result<()> {
                 Duration::from_secs(5)
             };
             let (remote, rx) = client::connect(&home, !upgraded, wait).await?;
-            match tui::run(remote, rx, theme, home, cwd, start).await? {
+            let model = if config.model == config::DEFAULT_MODEL {
+                None
+            } else {
+                Some(config.model.clone())
+            };
+            let effort = effort_override(&config);
+            match tui::run(remote, rx, theme, home, cwd, start, model, effort).await? {
                 tui::Exit::Quit => Ok(()),
                 tui::Exit::Exec { binary, session } => {
                     let mut cmd = std::process::Command::new(&binary);

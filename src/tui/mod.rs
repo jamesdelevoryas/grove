@@ -41,6 +41,7 @@ pub use theme::Theme;
 
 use crate::client::{self, Incoming, Remote};
 use crate::config;
+use crate::protocol::{Effort, Level};
 use crate::wire::Request;
 use app::{Action, App};
 
@@ -149,6 +150,7 @@ fn restore(enhanced: bool) {
     let _ = crossterm::terminal::disable_raw_mode();
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     remote: Remote,
     mut incoming: mpsc::UnboundedReceiver<Incoming>,
@@ -156,20 +158,27 @@ pub async fn run(
     home: PathBuf,
     cwd: PathBuf,
     start: Start,
+    model: Option<String>,
+    effort: Option<Effort>,
 ) -> Result<Exit> {
     let (mut term, mut guard) = setup()?;
     let mut app = App::new(remote, theme, home.clone(), cwd.clone());
+    app.new_model = model.clone();
+    app.new_effort = effort;
     match start {
         Start::List => {}
         Start::Attach(id) => app.enter_session(&id),
         Start::New(prompt) => app.remote.send(Request::Create {
             cwd,
             prompt: Some(prompt),
-            model: None,
-            effort: None,
+            model,
+            effort,
             attach: true,
         }),
     }
+    // Set while the server connection is down: when to try again, and how often we have.
+    let mut retry_at: Option<Instant> = None;
+    let mut retries = 0u32;
     let mut input = EventStream::new();
     let mut dirty = true;
     let mut urgent = true;
@@ -222,7 +231,7 @@ pub async fn run(
                 dirty = true;
                 urgent = true;
             }
-            msg = incoming.recv() => {
+            msg = incoming.recv(), if retry_at.is_none() => {
                 let mut batch = Vec::new();
                 match msg {
                     Some(m) => batch.push(m),
@@ -236,16 +245,10 @@ pub async fn run(
                     match m {
                         Incoming::Reply(reply) => app.on_reply(reply),
                         Incoming::Disconnected => {
-                            if app.exec.is_some() {
-                                break;
-                            }
-                            app.toast(crate::protocol::Level::Warn, "lost the grove server; reconnecting…");
-                            draw(&mut term, &mut app)?;
-                            let (r, rx) = client::connect(&home, true, Duration::from_secs(10)).await?;
-                            app.remote = r;
-                            incoming = rx;
-                            if let Some(info) = app.session.clone() {
-                                app.enter_session(&info.id);
+                            if app.exec.is_none() {
+                                app.toast(Level::Warn, "lost the grove server; reconnecting…");
+                                retry_at = Some(Instant::now() + Duration::from_millis(200));
+                                retries = 0;
                             }
                             break;
                         }
@@ -255,6 +258,29 @@ pub async fn run(
                 if !frozen {
                     dirty = true;
                 }
+            }
+            _ = tokio::time::sleep_until(retry_at.unwrap_or(next_frame)), if retry_at.is_some() => {
+                // Give a restarting server a few seconds before starting a fresh one.
+                let autostart = retries >= 10;
+                match client::connect(&home, autostart, Duration::from_millis(300)).await {
+                    Ok((r, rx)) => {
+                        app.remote = r;
+                        incoming = rx;
+                        retry_at = None;
+                        if let Some(info) = app.session.clone() {
+                            app.enter_session(&info.id);
+                        }
+                        app.toast(Level::Info, "reconnected");
+                    }
+                    Err(e) => {
+                        retries += 1;
+                        if retries.is_multiple_of(10) {
+                            app.toast(Level::Alert, format!("can't reach the grove server: {e:#}"));
+                        }
+                        retry_at = Some(Instant::now() + Duration::from_millis(500));
+                    }
+                }
+                dirty = true;
             }
             _ = spinner.tick(), if animate => {
                 app.spinner = app.spinner.wrapping_add(1);

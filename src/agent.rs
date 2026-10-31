@@ -155,7 +155,11 @@ impl Agent {
             }
             self.abort = None;
             if self.paused {
-                // Whatever arrived must survive the exec; it runs after Resume or restart.
+                // Whatever arrived must survive the exec, and run after Resume or restart.
+                if self.wake {
+                    self.meta.resume_on_start = true;
+                    self.wake = false;
+                }
                 self.save_meta();
                 continue;
             }
@@ -168,6 +172,7 @@ impl Agent {
                 self.turn().await;
             }
         }
+        self.hub.remove_agent(&id);
     }
 
     /// Takes in one input. Called both while idle and mid-turn; mid-turn, text input is

@@ -111,6 +111,12 @@ pub struct App {
     /// Set when the server restarts into a new build: the UI execs it too.
     pub exec: Option<PathBuf>,
     delete_armed: Option<(String, Instant)>,
+    /// Between Attached and Synced: replaying history, so no toasts or unread marks.
+    syncing: bool,
+    last_interrupt: Option<Instant>,
+    /// --model / --effort from the command line, for sessions started here.
+    pub new_model: Option<String>,
+    pub new_effort: Option<Effort>,
     pub theme: Theme,
     pub views: Vec<AgentView>,
     pub focus: usize,
@@ -149,6 +155,10 @@ impl App {
             proposal: None,
             exec: None,
             delete_armed: None,
+            syncing: false,
+            last_interrupt: None,
+            new_model: None,
+            new_effort: None,
             theme,
             views: Vec::new(),
             focus: 0,
@@ -216,6 +226,7 @@ impl App {
                 }
             }
             Reply::Attached { info } => {
+                self.syncing = true;
                 self.views.clear();
                 self.focus = 0;
                 self.session = Some(info);
@@ -233,6 +244,17 @@ impl App {
             Reply::Error { message } => self.toast(Level::Alert, message),
             Reply::Info { message } => self.toast(Level::Info, message),
             Reply::Restarting { binary } => self.exec = Some(binary),
+            Reply::Synced { session } => {
+                if self.session.as_ref().is_some_and(|s| s.id == session) {
+                    self.syncing = false;
+                }
+            }
+            Reply::Stopped { session } => {
+                if self.session.as_ref().is_some_and(|s| s.id == session) {
+                    self.leave_session();
+                    self.toast(Level::Info, format!("session {session} was stopped"));
+                }
+            }
         }
     }
 
@@ -272,9 +294,13 @@ impl App {
             KeyCode::Char('d') if ctrl && empty => self.arm_quit(),
             KeyCode::Char('l') if ctrl => return Action::Redraw,
             KeyCode::Up if empty && n > 0 => self.list_sel = self.list_sel.saturating_sub(1),
-            KeyCode::Char('p') if ctrl && n > 0 => self.list_sel = self.list_sel.saturating_sub(1),
+            KeyCode::Char('p') if ctrl && empty && n > 0 => {
+                self.list_sel = self.list_sel.saturating_sub(1)
+            }
             KeyCode::Down if empty && n > 0 => self.list_sel = (self.list_sel + 1).min(n - 1),
-            KeyCode::Char('n') if ctrl && n > 0 => self.list_sel = (self.list_sel + 1).min(n - 1),
+            KeyCode::Char('n') if ctrl && empty && n > 0 => {
+                self.list_sel = (self.list_sel + 1).min(n - 1)
+            }
             KeyCode::Home if empty => self.list_sel = 0,
             KeyCode::End if empty => self.list_sel = n.saturating_sub(1),
             KeyCode::Enter | KeyCode::Right if empty && !alt && !shift => {
@@ -349,6 +375,9 @@ impl App {
     }
 
     pub fn animating(&self) -> bool {
+        if self.screen == Screen::List {
+            return self.sessions.iter().any(|s| s.busy);
+        }
         for v in &self.views {
             if v.status.busy() {
                 return true;
@@ -418,6 +447,7 @@ impl App {
             return;
         };
         let focused = i == self.focus;
+        let syncing = self.syncing;
         let mut toast = None;
         {
             let view = &mut self.views[i];
@@ -454,6 +484,7 @@ impl App {
                     }
                     if view.transcript.apply(kind)
                         && !focused
+                        && !syncing
                         && !matches!(kind, EventKind::History(_))
                     {
                         view.unread = true;
@@ -461,7 +492,9 @@ impl App {
                 }
             }
         }
-        if let Some((level, text)) = toast {
+        if let Some((level, text)) = toast
+            && !syncing
+        {
             self.toast(level, text);
         }
     }
@@ -691,6 +724,9 @@ impl App {
             KeyCode::Esc
                 if self.screen == Screen::Session
                     && self.editor.is_empty()
+                    && self
+                        .last_interrupt
+                        .is_none_or(|t| t.elapsed() > Duration::from_millis(1500))
                     && !self
                         .focused()
                         .is_some_and(|v| v.status.busy() || v.scroll > 0) =>
@@ -700,6 +736,7 @@ impl App {
             KeyCode::Esc => {
                 if self.focused().is_some_and(|v| v.status.busy()) {
                     let id = self.focused_id();
+                    self.last_interrupt = Some(Instant::now());
                     let _ = self.input(&id, Input::Interrupt);
                 } else if let Some(v) = self.focused_mut() {
                     v.scroll = 0;
@@ -812,8 +849,8 @@ impl App {
             self.remote.send(Request::Create {
                 cwd: self.cwd.clone(),
                 prompt: Some(text),
-                model: None,
-                effort: None,
+                model: self.new_model.clone(),
+                effort: self.new_effort,
                 attach: false,
             });
             return;

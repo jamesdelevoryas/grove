@@ -9,6 +9,8 @@ use crate::protocol::{AgentId, Effort, Event, Input};
 use crate::store::SessionInfo;
 
 pub const SOCKET: &str = "server.sock";
+/// Names the lock descriptor a self-upgrading server hands to its successor.
+pub const LOCK_FD_ENV: &str = "GROVE_SERVER_LOCK_FD";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -92,6 +94,14 @@ pub enum Reply {
     Event {
         session: String,
         event: Event,
+    },
+    /// Everything that happened before attaching has been sent; what follows is live.
+    Synced {
+        session: String,
+    },
+    /// The session was stopped; UIs viewing it go back to the list.
+    Stopped {
+        session: String,
     },
     Proposal {
         summary: Option<String>,

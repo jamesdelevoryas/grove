@@ -117,8 +117,9 @@ fn start_server(home: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
-        // It must not belong to the UI's process: no inherited upgrade marker.
-        .env_remove("GROVE_UPGRADED");
+        // It must not inherit the UI's upgrade marker or a lock meant for another server.
+        .env_remove("GROVE_UPGRADED")
+        .env_remove(crate::wire::LOCK_FD_ENV);
     // Safety: setsid only detaches the child from our terminal and session; it's
     // async-signal-safe and touches no shared state.
     unsafe {

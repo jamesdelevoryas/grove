@@ -29,6 +29,8 @@ struct Inner {
     store: Store,
     config: Config,
     memory: RwLock<Option<Arc<Mcp>>>,
+    /// Set by `close`: no agent or watcher may start after it.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 struct Handle {
@@ -54,6 +56,7 @@ impl Hub {
             store,
             config,
             memory: RwLock::new(None),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -87,17 +90,40 @@ impl Hub {
     /// A feed of semantic events (no streaming deltas), for watchers.
     pub fn observe(&self) -> mpsc::UnboundedReceiver<Arc<Event>> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.0.observers.lock().unwrap().push(tx);
+        // A closed hub hands out a feed that's already over.
+        if !self.is_closed() {
+            self.0.observers.lock().unwrap().push(tx);
+        }
         rx
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.0.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Called by an agent's task as it ends.
+    pub fn remove_agent(&self, id: &str) {
+        self.0.agents.lock().unwrap().retain(|h| h.meta.id != id);
     }
 
     /// Ends every agent task and watcher feed, so an unloaded session lets go of
     /// everything. Interrupt or pause first if work should be cut short cleanly.
-    pub fn close(&self) {
+    pub async fn close(&self) {
+        self.0
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         for id in self.ids() {
             let _ = self.send(&id, Input::Exit);
         }
         self.0.observers.lock().unwrap().clear();
+        // Wait for the tasks to end, so nothing they write lands after this session is
+        // reloaded. A tool can take a few seconds to die (bash gets SIGTERM, then KILL).
+        for _ in 0..400 {
+            if self.0.agents.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     pub fn notify(&self, agent: &str, level: Level, text: &str) {
@@ -299,6 +325,9 @@ impl Hub {
     pub fn start(&self, meta: AgentMeta, history: Vec<Value>, tools: Vec<Value>) -> AgentId {
         let (tx, rx) = mpsc::unbounded_channel();
         let id = meta.id.clone();
+        if self.is_closed() {
+            return id;
+        }
         let log = match self.0.store.message_log(&id) {
             Ok(log) => log,
             Err(e) => {

@@ -171,7 +171,16 @@ impl Transcript {
                     }
                     self.open_text = None;
                 }
-                Some("thinking") => self.open_progress = None,
+                Some("thinking") => {
+                    // Replayed history has no deltas: the finished block carries the text.
+                    if self.open_progress.is_none() {
+                        let text = block["thinking"].as_str().unwrap_or("");
+                        if !text.trim().is_empty() {
+                            self.push(Kind::Progress(text.to_string()));
+                        }
+                    }
+                    self.open_progress = None;
+                }
                 Some("tool_use") => {
                     self.close_open();
                     self.push_tool(block);
