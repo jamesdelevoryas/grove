@@ -34,6 +34,8 @@ pub struct Agent {
     abort: Option<Abort>,
     /// The last turn failed; keep showing the error until new input arrives.
     errored: bool,
+    /// Paused for an upgrade: input is queued and saved, but no turn starts until Resume.
+    paused: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -64,9 +66,28 @@ impl Agent {
             wake: false,
             abort: None,
             errored: false,
+            paused: false,
         };
+        agent.reconcile();
         agent.repair();
         agent
+    }
+
+    pub fn meta(&self) -> &AgentMeta {
+        &self.meta
+    }
+
+    /// A crash after a turn was written to the log but before meta.json was saved leaves
+    /// meta's pending input already in history; drop it rather than send it twice.
+    fn reconcile(&mut self) {
+        if self.messages.len() != self.meta.committed {
+            if self.messages.len() > self.meta.committed {
+                self.meta.pending_results.clear();
+                self.meta.pending.clear();
+                self.meta.directives.clear();
+            }
+            self.meta.committed = self.messages.len();
+        }
     }
 
     /// A crash between the assistant's tool calls and their results leaves calls without
@@ -110,7 +131,11 @@ impl Agent {
             self.turn().await;
         }
         loop {
-            if !self.meta.stopped && !self.errored {
+            if self.paused {
+                self.hub.set_status(&id, Status::Paused);
+            } else if self.meta.stopped {
+                self.hub.set_status(&id, Status::Stopped);
+            } else if !self.errored {
                 self.hub.set_status(&id, Status::Idle);
             }
             let Some(input) = self.rx.recv().await else {
@@ -125,9 +150,13 @@ impl Agent {
                 break;
             }
             self.abort = None;
+            if self.paused {
+                // Whatever arrived must survive the exec; it runs after Resume or restart.
+                self.save_meta();
+                continue;
+            }
             if self.meta.stopped {
                 self.wake = false;
-                self.hub.set_status(&id, Status::Stopped);
                 continue;
             }
             if self.wake {
@@ -192,7 +221,17 @@ impl Agent {
             Input::Interrupt => self.abort = Some(Abort::Interrupt),
             Input::Pause => {
                 self.abort = Some(Abort::Pause);
+                self.paused = true;
                 // Queued input must survive the restart even if we're idle.
+                self.save_meta();
+            }
+            Input::Resume => {
+                // The upgrade was abandoned: carry on in this process.
+                self.paused = false;
+                if self.meta.resume_on_start {
+                    self.meta.resume_on_start = false;
+                    self.wake = true;
+                }
                 self.save_meta();
             }
             Input::Stop => {
@@ -203,6 +242,7 @@ impl Agent {
             Input::Clear => {
                 self.abort = Some(Abort::Clear);
                 self.messages.clear();
+                self.meta.committed = 0;
                 self.meta.pending.clear();
                 self.meta.pending_results.clear();
                 self.meta.directives.clear();
@@ -231,15 +271,21 @@ impl Agent {
         self.hub.update_meta(&self.meta);
     }
 
-    fn push(&mut self, message: Value) {
-        if let Err(e) = self.log.append(&message) {
+    /// Appends one exchange to history with a single write, so a crash never leaves half
+    /// of it in the log, then records how much history meta.json accounts for.
+    fn commit(&mut self, messages: Vec<Value>) {
+        if let Err(e) = self.log.append_all(&messages) {
             self.hub.notify(
                 &self.meta.id,
                 Level::Alert,
                 &format!("couldn't save the conversation: {e:#}"),
             );
         }
-        self.messages.push(message);
+        for m in messages {
+            self.messages.push(m);
+        }
+        self.meta.committed = self.messages.len();
+        self.save_meta();
     }
 
     fn has_pending(&self) -> bool {
@@ -308,26 +354,46 @@ impl Agent {
             };
             self.record_usage(&response.usage);
 
+            if response.stop_reason == StopReason::Refusal {
+                // Keep nothing from a declined exchange; the human can rephrase. Tool
+                // results still have to answer the calls already in history, so they stay
+                // queued, with their content withheld.
+                for result in self.meta.pending_results.iter_mut().take(counts.0) {
+                    result["content"] =
+                        json!("[withheld: the model declined to continue after this result]");
+                    result["is_error"] = json!(true);
+                }
+                self.meta.pending.drain(..counts.1);
+                self.meta.directives.drain(..counts.2);
+                self.hub.notify(
+                    &id,
+                    Level::Warn,
+                    "the model declined this request (refusal); nothing was added to the conversation",
+                );
+                self.save_meta();
+                break;
+            }
+
             // The request was answered: what was pending is now history.
             self.meta.pending_results.drain(..counts.0);
             self.meta.pending.drain(..counts.1);
             self.meta.directives.drain(..counts.2);
-
-            if response.stop_reason == StopReason::Refusal {
-                // Don't keep a declined exchange; the human can rephrase.
-                self.hub.notify(&id, Level::Warn, "the model declined this request (refusal); nothing was added to the conversation");
-                self.save_meta();
-                break;
-            }
-            for message in tail {
-                self.push(message);
-            }
             let mut content = Vec::new();
+            let mut has_text_or_call = false;
             for block in &response.content {
+                if block["type"] == "text" || block["type"] == "tool_use" {
+                    has_text_or_call = true;
+                }
                 content.push(api::clean_block(block));
             }
-            self.push(json!({ "role": "assistant", "content": content }));
-            self.save_meta();
+            // An assistant message with nothing to say would make every later request
+            // invalid; give it a placeholder.
+            if !has_text_or_call {
+                content.push(json!({ "type": "text", "text": "(no response)" }));
+            }
+            let mut exchange = tail;
+            exchange.push(json!({ "role": "assistant", "content": content }));
+            self.commit(exchange);
 
             let mut calls = Vec::new();
             for block in &response.content {

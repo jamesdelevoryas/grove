@@ -15,6 +15,7 @@ use crate::protocol::Effort;
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const BETAS: &str = "thinking-display-updates-2026-08-18,server-side-fallback-2026-07-01";
 const MAX_ATTEMPTS: u32 = 5;
+const STREAM_STALL: Duration = Duration::from_secs(180);
 
 #[derive(Clone)]
 pub struct Client {
@@ -141,7 +142,16 @@ impl Client {
 
         let mut stream = MessageStream::default();
         let mut buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = resp.chunk().await? {
+        loop {
+            // The API sends pings while it works; this long a silence means a dead connection.
+            let chunk = match tokio::time::timeout(STREAM_STALL, resp.chunk()).await {
+                Ok(chunk) => chunk?,
+                Err(_) => bail!(
+                    "the response stream stalled ({}s without data)",
+                    STREAM_STALL.as_secs()
+                ),
+            };
+            let Some(chunk) = chunk else { break };
             buf.extend_from_slice(&chunk);
             while let Some(end) = find_event_end(&buf) {
                 let event: Vec<u8> = buf.drain(..end).collect();

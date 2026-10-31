@@ -229,6 +229,13 @@ impl Editor {
         let mut col = prefix_w;
         let mut cursor = (0, prefix_w);
         for (i, c) in self.text.char_indices() {
+            let w = if c == '\n' { 0 } else { c.width().unwrap_or(0) };
+            // Wrap before placing the cursor, so a cursor on a wrapping character sits at
+            // the start of the next row, not past the edge.
+            if c != '\n' && col + w > width {
+                rows.push(String::new());
+                col = prefix_w;
+            }
             if i == self.cursor {
                 cursor = (rows.len() - 1, col);
             }
@@ -236,11 +243,6 @@ impl Editor {
                 rows.push(String::new());
                 col = prefix_w;
                 continue;
-            }
-            let w = c.width().unwrap_or(0);
-            if col + w > width {
-                rows.push(String::new());
-                col = prefix_w;
             }
             rows.last_mut().unwrap().push(c);
             col += w;
@@ -293,6 +295,17 @@ mod tests {
         e.insert("_");
         assert_eq!(e.text(), "abcdef_\nxy\nlonger line");
         assert!(!e.up());
+    }
+
+    #[test]
+    fn cursor_on_a_wrapping_char_moves_to_the_next_row() {
+        let mut e = Editor::default();
+        e.insert("abcdefgh");
+        e.left();
+        e.left();
+        // "abcdef" fills the first row (width 8, prompt 2); the cursor is on 'g'.
+        let (_, cursor) = e.layout(8, 2);
+        assert_eq!(cursor, (1, 2));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //!   sessions/<session>/agents/<agent>/messages.jsonl
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -119,20 +119,20 @@ impl Store {
 
     fn load_messages(&self, id: &AgentId) -> Result<Vec<Value>> {
         let path = self.agent_dir(id).join("messages.jsonl");
-        let Ok(file) = File::open(&path) else {
+        let Ok(text) = fs::read_to_string(&path) else {
             return Ok(Vec::new());
         };
-        let mut messages = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
+        let (messages, intact) = parse_log(&text);
+        if !intact {
+            // Rewrite without the damaged tail, so later appends start on a clean line.
+            let mut clean = Vec::new();
+            for m in &messages {
+                clean.extend(serde_json::to_vec(m)?);
+                clean.push(b'\n');
             }
-            // A torn last line (crash mid-write) is dropped rather than failing the load.
-            match serde_json::from_str(&line) {
-                Ok(v) => messages.push(v),
-                Err(_) => break,
-            }
+            let tmp = path.with_extension("jsonl.tmp");
+            fs::write(&tmp, clean)?;
+            fs::rename(&tmp, &path)?;
         }
         Ok(messages)
     }
@@ -156,10 +156,15 @@ pub struct MessageLog {
 }
 
 impl MessageLog {
-    pub fn append(&mut self, message: &Value) -> Result<()> {
-        let mut line = serde_json::to_vec(message)?;
-        line.push(b'\n');
-        self.file.write_all(&line)?;
+    /// Appends messages with one write, so an exchange lands whole or (after a crash
+    /// mid-write) as a torn tail that `parse_log` drops.
+    pub fn append_all(&mut self, messages: &[Value]) -> Result<()> {
+        let mut bytes = Vec::new();
+        for m in messages {
+            bytes.extend(serde_json::to_vec(m)?);
+            bytes.push(b'\n');
+        }
+        self.file.write_all(&bytes)?;
         self.file.flush()?;
         Ok(())
     }
@@ -183,6 +188,40 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// The longest valid history in a log: complete, parseable lines, ending with an assistant
+/// message (every exchange is written as user [system] assistant, so anything after the
+/// last assistant message is an exchange cut off mid-write). Returns whether the log was
+/// intact.
+fn parse_log(text: &str) -> (Vec<Value>, bool) {
+    let mut messages = Vec::new();
+    // Every record ends with a newline; anything after the last one was cut off.
+    let complete = match text.rfind('\n') {
+        Some(i) => &text[..i + 1],
+        None => "",
+    };
+    let mut intact = complete.len() == text.len();
+    for line in complete.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(v) => messages.push(v),
+            Err(_) => {
+                intact = false;
+                break;
+            }
+        }
+    }
+    while let Some(last) = messages.last() {
+        if last["role"] == "assistant" {
+            break;
+        }
+        messages.pop();
+        intact = false;
+    }
+    (messages, intact)
 }
 
 pub fn load_history(path: &Path) -> Vec<String> {
@@ -209,4 +248,36 @@ pub fn append_history(path: &Path, entry: &str) {
         return;
     };
     let _ = writeln!(file, "{line}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_recovery_keeps_whole_exchanges() {
+        let u = r#"{"role":"user","content":[]}"#;
+        let a = r#"{"role":"assistant","content":[]}"#;
+        let s = r#"{"role":"system","content":"x"}"#;
+        let good = format!("{u}\n{a}\n");
+        assert_eq!(
+            parse_log(&good),
+            (
+                vec![
+                    serde_json::from_str(u).unwrap(),
+                    serde_json::from_str(a).unwrap()
+                ],
+                true
+            )
+        );
+        // Torn final record.
+        let (m, intact) = parse_log(&format!("{good}{u}\n{s}\n{{\"role\":\"assi"));
+        assert_eq!(m.len(), 2);
+        assert!(!intact);
+        // A whole exchange minus its assistant message.
+        let (m, intact) = parse_log(&format!("{good}{u}\n"));
+        assert_eq!(m.len(), 2);
+        assert!(!intact);
+        assert_eq!(parse_log(""), (vec![], true));
+    }
 }

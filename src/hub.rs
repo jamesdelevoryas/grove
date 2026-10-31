@@ -132,7 +132,13 @@ impl Hub {
                 }
             }
         }
-        let _ = self.0.store.save_meta(meta);
+        if let Err(e) = self.0.store.save_meta(meta) {
+            self.notify(
+                &meta.id,
+                Level::Alert,
+                &format!("can't save agent state: {e:#}"),
+            );
+        }
         self.emit(&meta.id, EventKind::Meta(meta.clone()));
     }
 
@@ -164,6 +170,16 @@ impl Hub {
             }
         }
         false
+    }
+
+    fn all_paused(&self, ids: &[AgentId]) -> bool {
+        let agents = self.0.agents.lock().unwrap();
+        for h in agents.iter() {
+            if ids.contains(&h.meta.id) && h.status != Status::Paused {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn send(&self, to: &str, input: Input) -> Result<()> {
@@ -274,6 +290,7 @@ impl Hub {
             pending_results: Vec::new(),
             pending: Vec::new(),
             directives: Vec::new(),
+            committed: 0,
         }
     }
 
@@ -281,32 +298,41 @@ impl Hub {
     pub fn start(&self, meta: AgentMeta, history: Vec<Value>, tools: Vec<Value>) -> AgentId {
         let (tx, rx) = mpsc::unbounded_channel();
         let id = meta.id.clone();
-        let _ = self.0.store.save_meta(&meta);
+        let log = match self.0.store.message_log(&id) {
+            Ok(log) => log,
+            Err(e) => {
+                self.emit(&id, EventKind::Spawned(meta.clone()));
+                self.notify(
+                    &id,
+                    Level::Alert,
+                    &format!("can't open the message log: {e:#}"),
+                );
+                return id;
+            }
+        };
+        // The agent repairs its saved state first (e.g. answering tool calls a crash cut
+        // off), so the UI is shown the repaired version.
+        let shared_history = Arc::new(history.clone());
+        let agent = Agent::new(self.clone(), meta, history, tools, log, rx);
+        let meta = agent.meta().clone();
+        if let Err(e) = self.0.store.save_meta(&meta) {
+            self.notify(&id, Level::Alert, &format!("can't save agent state: {e:#}"));
+        }
         self.0.agents.lock().unwrap().push(Handle {
             meta: meta.clone(),
             tx,
             status: Status::Idle,
         });
         self.emit(&id, EventKind::Spawned(meta.clone()));
-        if !history.is_empty() {
-            self.emit(&id, EventKind::History(Arc::new(history.clone())));
+        if !shared_history.is_empty() {
+            self.emit(&id, EventKind::History(shared_history));
         }
         let mut pending = meta.pending_results.clone();
         pending.extend(meta.pending.iter().cloned());
         if !pending.is_empty() {
             self.emit(&id, EventKind::Pending(pending));
         }
-        match self.0.store.message_log(&id) {
-            Ok(log) => {
-                let agent = Agent::new(self.clone(), meta, history, tools, log, rx);
-                tokio::spawn(agent.run());
-            }
-            Err(e) => self.notify(
-                &id,
-                Level::Alert,
-                &format!("can't open the message log: {e:#}"),
-            ),
-        }
+        tokio::spawn(agent.run());
         id
     }
 
@@ -441,15 +467,20 @@ impl Hub {
         for id in &ids {
             let _ = self.send(id, Input::Pause);
         }
-        // Agents save their state as they pause; wait for all of them to settle.
+        // Each agent saves its state, then reports Paused. Wait for every one of them.
+        let mut all_paused = false;
         for _ in 0..200 {
-            if !self.any_busy() {
+            if self.all_paused(&ids) {
+                all_paused = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        if self.any_busy() {
-            bail!("agents didn't pause within 5s; not restarting");
+        if !all_paused {
+            for id in &ids {
+                let _ = self.send(id, Input::Resume);
+            }
+            bail!("agents didn't pause within 5s; resumed them, not restarting");
         }
         self.0.upgrade.lock().unwrap().proposal = None;
         let _ = self.0.ui_cmd.send(UiCommand::Exec {

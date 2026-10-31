@@ -208,6 +208,29 @@ impl Transcript {
             }
             EventKind::ResponseDiscarded => {
                 self.close_open();
+                // Tool calls streamed in the thrown-away response never ran.
+                let mut changed = Vec::new();
+                for i in (0..self.entries.len()).rev() {
+                    let entry = &mut self.entries[i];
+                    if let Kind::User(_) = entry.kind {
+                        break;
+                    }
+                    if let Kind::Tool {
+                        result,
+                        running: false,
+                        is_error,
+                        ..
+                    } = &mut entry.kind
+                        && result.is_none()
+                    {
+                        *result = Some("not run: the response was interrupted".into());
+                        *is_error = true;
+                        changed.push(i);
+                    }
+                }
+                for i in changed {
+                    self.touch(i);
+                }
                 self.push(Kind::Notice {
                     level: Level::Warn,
                     text: "interrupted".into(),
@@ -468,29 +491,27 @@ fn block(
     for s in &first {
         prefix_w += unicode_width::UnicodeWidthStr::width(s.content.as_ref());
     }
+    // Counts wrapped rows, so "+N lines" is right even for one very long line.
     let mut shown = 0;
     let mut total = 0;
     let mut first = Some(first);
+    let mut any = false;
     for raw in text.lines() {
-        total += 1;
-        if shown >= max_lines {
-            continue;
-        }
+        any = true;
         let mut spans = match first.take() {
             Some(f) => f,
             None => vec![Span::raw(" ".repeat(prefix_w))],
         };
         spans.push(Span::styled(raw.replace('\t', "    "), style));
         for l in wrap(&Line::from(spans).style(row), width, prefix_w) {
+            total += 1;
             if shown < max_lines {
                 out.push(l);
                 shown += 1;
             }
         }
     }
-    if total == 0
-        && let Some(f) = first
-    {
+    if !any && let Some(f) = first {
         out.push(Line::from(f).style(row));
     }
     total

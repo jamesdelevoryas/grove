@@ -113,6 +113,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         vertical: 0,
     });
     block.render(input, f.buffer_mut());
+    // A short terminal can give the box fewer rows than the text wants.
+    let input_rows = input_rows.min(inner.height as usize);
+    if input_rows == 0 {
+        draw_status(f.buffer_mut(), status, app, &theme);
+        return;
+    }
     let first_row = cursor.0.saturating_sub(input_rows - 1);
     if app.editor.is_empty() {
         let placeholder = match app.focused() {

@@ -53,8 +53,19 @@ pub enum Exit {
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
+/// Restores the terminal when dropped, so every error path out of `run` leaves a usable
+/// shell. Disarmed only for the exec into an upgraded grove, which keeps the screen.
 struct Guard {
     enhanced: bool,
+    armed: bool,
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if self.armed {
+            restore(self.enhanced);
+        }
+    }
 }
 
 fn setup() -> Result<(Term, Guard)> {
@@ -76,11 +87,41 @@ fn setup() -> Result<(Term, Guard)> {
     }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore(enhanced);
-        previous(info);
+        // The UI runs on the main thread: a panic there ends grove, so give the terminal
+        // back first. A panic in an agent or tool task only ends that task; printing it
+        // would scribble over the live screen, so it goes to a log instead.
+        if std::thread::current().name() == Some("main") {
+            restore(enhanced);
+            previous(info);
+            return;
+        }
+        log_panic(&info.to_string());
     }));
     let term = Terminal::new(CrosstermBackend::new(stdout()))?;
-    Ok((term, Guard { enhanced }))
+    Ok((
+        term,
+        Guard {
+            enhanced,
+            armed: true,
+        },
+    ))
+}
+
+fn log_panic(text: &str) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let path = std::path::Path::new(&home).join(".grove/panic.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{} {text}", chrono::Local::now().to_rfc3339());
+    }
+}
+
+/// Puts the terminal back to normal; safe to call when it isn't in grove's modes.
+pub fn restore_terminal() {
+    restore(true);
 }
 
 fn restore(enhanced: bool) {
@@ -104,7 +145,7 @@ pub async fn run(
     mut commands: mpsc::UnboundedReceiver<UiCommand>,
     theme: Theme,
 ) -> Result<Exit> {
-    let (mut term, guard) = setup()?;
+    let (mut term, mut guard) = setup()?;
     let mut app = App::new(hub.clone(), theme);
     let mut input = EventStream::new();
     let mut frozen = false;
@@ -202,10 +243,15 @@ pub async fn run(
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        restore(guard.enhanced);
-    } else if guard.enhanced {
-        // The new process pushes its own flags; don't leave ours stacked.
-        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+        // The guard restores the terminal as it drops.
+    } else {
+        // Hand the terminal over still in the alternate screen (no flash), but in cooked
+        // mode: the new process records the mode it finds as the one to restore on exit.
+        guard.armed = false;
+        if guard.enhanced {
+            let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+        }
+        let _ = crossterm::terminal::disable_raw_mode();
     }
     Ok(exit)
 }

@@ -80,6 +80,11 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            // An upgraded grove starts inside the old one's fullscreen; if it fails before
+            // its UI is up, give the terminal back before printing.
+            if std::env::var_os("GROVE_UPGRADED").is_some() {
+                tui::restore_terminal();
+            }
             eprintln!("grove: {e:#}");
             ExitCode::FAILURE
         }
@@ -166,7 +171,9 @@ async fn run() -> Result<()> {
             // Replace this process; the terminal stays in fullscreen mode across the swap.
             let err = std::process::Command::new(&binary)
                 .args(["--resume", &session])
+                .env("GROVE_UPGRADED", "1")
                 .exec();
+            tui::restore_terminal();
             Err(err).with_context(|| format!("exec {}", binary.display()))
         }
     }

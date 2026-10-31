@@ -97,6 +97,9 @@ pub struct AgentMeta {
     pub pending: Vec<Value>,
     #[serde(default)]
     pub directives: Vec<String>,
+    /// How many messages of history this meta accounts for (see Agent::reconcile).
+    #[serde(default)]
+    pub committed: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -168,6 +171,8 @@ pub enum Input {
     Clear,
     /// Try the turn again after an error (pending input is still there).
     Retry,
+    /// Undo a Pause (an upgrade that didn't happen).
+    Resume,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
