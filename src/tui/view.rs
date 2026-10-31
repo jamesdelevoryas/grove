@@ -51,23 +51,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let input_inner_w = area.width.saturating_sub(4) as usize;
     let (rows, cursor) = app.editor.layout(input_inner_w, 2);
-    let input_rows = rows.len().clamp(1, MAX_INPUT_ROWS);
     let menu = app.menu();
     let busy = app.focused().is_some_and(|v| v.status.busy());
+    // Suggested next prompts show as ghost text inside the empty input, one per row.
     let suggestions = match app.focused() {
-        Some(v) if !busy && v.suggestions.len() > 1 && app.editor.is_empty() => {
-            v.suggestions.clone()
-        }
+        Some(v) if !busy && app.editor.is_empty() => v.suggestions.clone(),
         _ => Vec::new(),
     };
+    let input_rows = rows.len().max(suggestions.len()).clamp(1, MAX_INPUT_ROWS);
 
-    let [header, body, activity, menu_area, input, sugg, status] = Layout::vertical([
+    let [header, body, activity, menu_area, input, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(if busy { 1 } else { 0 }),
         Constraint::Length(menu.len().min(8) as u16),
         Constraint::Length(input_rows as u16 + 2),
-        Constraint::Length(if suggestions.is_empty() { 0 } else { 1 }),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -125,9 +123,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
     let first_row = cursor.0.saturating_sub(input_rows - 1);
-    if app.editor.is_empty() {
+    if app.editor.is_empty() && !suggestions.is_empty() {
+        for (k, s) in suggestions.iter().take(input_rows).enumerate() {
+            let prefix = if k == 0 { "❯ " } else { "  " };
+            let line = Line::from(vec![
+                Span::styled(prefix, theme.accent()),
+                Span::styled(s.clone(), theme.dim()),
+            ]);
+            let y = inner.y + k as u16;
+            f.buffer_mut().set_line(inner.x, y, &line, inner.width);
+            // Tab fills the first, a second Tab the next.
+            let hint = "⇥".repeat(k + 1);
+            let w = hint.chars().count() as u16;
+            if inner.width > w + 4 {
+                f.buffer_mut()
+                    .set_string(inner.x + inner.width - w, y, hint, theme.accent());
+            }
+        }
+    } else if app.editor.is_empty() {
         let placeholder = match app.focused() {
-            Some(v) if !busy && !v.suggestions.is_empty() => format!("{}   ⇥", v.suggestions[0]),
             Some(v) if v.meta.role.is_watcher() => format!("Talk to the {} agent…", v.meta.id),
             _ => "Ask, or type / for commands · ? for shortcuts".to_string(),
         };
@@ -158,18 +172,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             x: inner.x + cursor.1 as u16,
             y: inner.y + (cursor.0 - first_row) as u16,
         });
-    }
-
-    if !suggestions.is_empty() {
-        let mut spans = vec![Span::styled("  ⇥ ", theme.accent())];
-        for (i, s) in suggestions.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled("   ·   ", theme.dim()));
-            }
-            spans.push(Span::styled(s.clone(), theme.muted()));
-        }
-        f.buffer_mut()
-            .set_line(sugg.x, sugg.y, &Line::from(spans), sugg.width);
     }
 
     draw_status(f.buffer_mut(), status, app, &theme);
