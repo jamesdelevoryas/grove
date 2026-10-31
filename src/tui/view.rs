@@ -641,7 +641,7 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         ("shift+enter · ctrl+j", "newline"),
         ("esc", "interrupt the focused agent"),
         ("ctrl+c", "clear input · interrupt · twice to quit"),
-        ("ctrl+o", "freeze: j/k ^d/^u gg/G / v y, mouse-select"),
+        ("ctrl+o", "freeze: Helix keys (hjkl wbe x v f/t / y), mouse-select"),
         ("shift+tab", "cycle effort"),
         ("tab", "fill a suggested prompt (again: next one)"),
         ("ctrl+n · ctrl+p", "next · previous agent"),

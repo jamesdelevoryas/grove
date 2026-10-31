@@ -168,7 +168,7 @@ async fn renders_a_session() {
     app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
     let frozen = screen(&mut app, 120, 24);
     println!("{frozen}");
-    assert!(frozen.contains("VISUAL"));
+    assert!(frozen.contains(" SEL "));
     app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
     assert!(app.pager.is_none());
 

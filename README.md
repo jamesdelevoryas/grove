@@ -26,7 +26,7 @@ session: esc or ← on an empty prompt goes back to the list.
 | enter / shift+enter, ctrl+j | send / newline |
 | esc | interrupt the focused agent |
 | ctrl+c | clear input · interrupt · twice to quit |
-| **ctrl+o** | **freeze**: a still snapshot of the transcript while agents keep running. j/k line, ctrl+d/ctrl+u half page, ctrl+f/ctrl+b page, ctrl+e/ctrl+y scroll, gg/G, H/M/L, `/` search with n/N, `v` select lines + `y` copy; the mouse is released for native drag-select. q / esc / ctrl+o resumes |
+| **ctrl+o** | **freeze**: a still snapshot of the transcript, read like a Helix buffer while agents keep running. Cursor and selection: `hjkl`, `w b e` (`W B E`), `x` line (again to extend), `v` select mode, `;` collapse, `alt-;` flip, `f t F T` + char, `gg ge gh gl gs`, `%`, `/` with `n N`, ctrl-d/u/f/b, ctrl-e/y; `y` or `space y` copies the selection. The mouse is released for native drag-select. `q`, ctrl+o, or esc (with nothing selected) resumes |
 | shift+tab | cycle effort (low → max) |
 | tab | fill a suggested next prompt (again: the other one) |
 | ctrl+n / ctrl+p, alt+1…9, click | switch agent |
