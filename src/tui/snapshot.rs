@@ -228,6 +228,6 @@ async fn renders_a_session() {
     println!("{list}");
     assert!(list.contains("SESSIONS"));
     assert!(list.contains("Profile the TUI render loop"));
-    assert!(list.contains("Start a new session in ~/code/grove"));
+    assert!(list.contains("Type to start a new session in ~/code/grove"));
     let _ = std::fs::remove_dir_all(dir);
 }

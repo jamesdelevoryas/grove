@@ -7,6 +7,8 @@
 
 mod app;
 mod editor;
+#[cfg(test)]
+mod list_tests;
 mod markdown;
 mod pager;
 #[cfg(test)]

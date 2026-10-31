@@ -106,7 +106,10 @@ pub struct App {
     /// The attached session.
     pub session: Option<SessionInfo>,
     pub sessions: Vec<SessionSummary>,
-    pub list_sel: usize,
+    /// The highlighted session, or None when the prompt box has focus (and the cursor).
+    pub list_sel: Option<usize>,
+    /// The user has moved around the list; until then it follows the newest session.
+    list_touched: bool,
     pub proposal: Option<String>,
     /// Set when the server restarts into a new build: the UI execs it too.
     pub exec: Option<PathBuf>,
@@ -151,7 +154,8 @@ impl App {
             screen: Screen::List,
             session: None,
             sessions: Vec::new(),
-            list_sel: 0,
+            list_sel: None,
+            list_touched: false,
             proposal: None,
             exec: None,
             delete_armed: None,
@@ -216,8 +220,13 @@ impl App {
             }
             Reply::Sessions { list } => {
                 self.sessions = list;
-                if self.list_sel >= self.sessions.len() {
-                    self.list_sel = self.sessions.len().saturating_sub(1);
+                let n = self.sessions.len();
+                // Open on the newest session rather than in the prompt box.
+                if !self.list_touched && self.list_sel.is_none() && n > 0 {
+                    self.list_sel = Some(0);
+                }
+                if let Some(i) = self.list_sel {
+                    self.list_sel = if n == 0 { None } else { Some(i.min(n - 1)) };
                 }
             }
             Reply::Created { session } => {
@@ -270,7 +279,8 @@ impl App {
         if let Some(info) = &self.session
             && let Some(i) = self.sessions.iter().position(|s| s.id == info.id)
         {
-            self.list_sel = i;
+            self.list_sel = Some(i);
+            self.list_touched = true;
         }
         self.session = None;
         self.views.clear();
@@ -280,7 +290,8 @@ impl App {
     }
 
     fn selected_session(&self) -> Option<String> {
-        self.sessions.get(self.list_sel).map(|s| s.id.clone())
+        let i = self.list_sel?;
+        self.sessions.get(i).map(|s| s.id.clone())
     }
 
     fn list_key(&mut self, key: KeyEvent) -> Action {
@@ -293,28 +304,51 @@ impl App {
             KeyCode::Char('c') if ctrl => self.ctrl_c(),
             KeyCode::Char('d') if ctrl && empty => self.arm_quit(),
             KeyCode::Char('l') if ctrl => return Action::Redraw,
-            KeyCode::Up if empty && n > 0 => self.list_sel = self.list_sel.saturating_sub(1),
-            KeyCode::Char('p') if ctrl && empty && n > 0 => {
-                self.list_sel = self.list_sel.saturating_sub(1)
-            }
-            KeyCode::Down if empty && n > 0 => self.list_sel = (self.list_sel + 1).min(n - 1),
-            KeyCode::Char('n') if ctrl && empty && n > 0 => {
-                self.list_sel = (self.list_sel + 1).min(n - 1)
-            }
-            KeyCode::Home if empty => self.list_sel = 0,
-            KeyCode::End if empty => self.list_sel = n.saturating_sub(1),
-            KeyCode::Enter | KeyCode::Right if empty && !alt && !shift => {
-                if let Some(id) = self.selected_session() {
-                    self.enter_session(&id);
+            _ => {}
+        }
+        if matches!(key.code, KeyCode::Char('c' | 'd' | 'l')) && ctrl {
+            return Action::None;
+        }
+        self.list_touched = true;
+        match self.list_sel {
+            // A session is highlighted: arrows move, enter opens. The prompt box has no
+            // cursor until you move past the bottom or start typing.
+            Some(i) => match key.code {
+                KeyCode::Up => self.list_sel = Some(i.saturating_sub(1)),
+                KeyCode::Char('p') if ctrl => self.list_sel = Some(i.saturating_sub(1)),
+                KeyCode::Down => self.list_sel = if i + 1 < n { Some(i + 1) } else { None },
+                KeyCode::Char('n') if ctrl => {
+                    self.list_sel = if i + 1 < n { Some(i + 1) } else { None }
                 }
-            }
-            KeyCode::Char('x') if ctrl => {
-                if let Some(id) = self.selected_session() {
-                    self.remote.send(Request::Stop { session: id });
+                KeyCode::Home => self.list_sel = Some(0),
+                KeyCode::End => self.list_sel = Some(n.saturating_sub(1)),
+                KeyCode::Enter | KeyCode::Right => {
+                    if let Some(id) = self.selected_session() {
+                        self.enter_session(&id);
+                    }
                 }
-            }
-            KeyCode::Delete if empty => self.delete_selected(),
-            _ => self.input_key(key, ctrl, alt, shift),
+                KeyCode::Char('x') if ctrl => {
+                    if let Some(id) = self.selected_session() {
+                        self.remote.send(Request::Stop { session: id });
+                    }
+                }
+                KeyCode::Delete => self.delete_selected(),
+                KeyCode::Esc => {}
+                // Typing starts a new session: focus moves to the prompt, keeping the key.
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    self.list_sel = None;
+                    self.editor.insert_char(c);
+                    self.menu_sel = 0;
+                }
+                _ => {}
+            },
+            // The prompt box has focus.
+            None => match key.code {
+                KeyCode::Up if empty && n > 0 => self.list_sel = Some(n - 1),
+                KeyCode::Char('p') if ctrl && n > 0 => self.list_sel = Some(n - 1),
+                KeyCode::Esc if self.menu().is_empty() && n > 0 => self.list_sel = Some(n - 1),
+                _ => self.input_key(key, ctrl, alt, shift),
+            },
         }
         Action::None
     }
@@ -774,6 +808,10 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
+        // Pasting on the list goes to the prompt, like typing.
+        if self.screen == Screen::List {
+            self.list_sel = None;
+        }
         if self.mode != Mode::Input {
             self.mode = Mode::Input;
         }
@@ -1096,12 +1134,13 @@ impl App {
                 }
                 if let Some(i) = target {
                     // A click on the highlighted row opens it.
-                    if i == self.list_sel
+                    if self.list_sel == Some(i)
                         && let Some(id) = self.selected_session()
                     {
                         self.enter_session(&id);
                     }
-                    self.list_sel = i;
+                    self.list_sel = Some(i);
+                    self.list_touched = true;
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {

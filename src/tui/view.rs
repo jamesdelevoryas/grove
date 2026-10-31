@@ -137,8 +137,12 @@ fn draw_input(
 ) {
     let theme = app.theme;
     // Input box.
-    let border = if app.mode == Mode::Input {
-        theme.dim()
+    // On the list, the prompt box only has focus (and the cursor) when no session is
+    // highlighted.
+    let prompt_focused =
+        app.mode == Mode::Input && !(app.screen == Screen::List && app.list_sel.is_some());
+    let border = if prompt_focused {
+        theme.muted()
     } else {
         Style::new().fg(theme.dim).add_modifier(Modifier::DIM)
     };
@@ -176,8 +180,12 @@ fn draw_input(
         }
     } else if app.editor.is_empty() {
         let placeholder = match app.focused() {
+            _ if app.screen == Screen::List && app.list_sel.is_some() => format!(
+                "Type to start a new session in {}",
+                tilde(&app.cwd.display().to_string())
+            ),
             _ if app.screen == Screen::List => format!(
-                "Start a new session in {} · or ↑↓ and enter to open one",
+                "Start a new session in {} · ↑ back to the list",
                 tilde(&app.cwd.display().to_string())
             ),
             Some(v) if v.meta.role.is_watcher() => format!("Talk to the {} agent…", v.meta.id),
@@ -205,7 +213,7 @@ fn draw_input(
             );
         }
     }
-    if app.mode == Mode::Input {
+    if prompt_focused {
         f.set_cursor_position(Position {
             x: inner.x + cursor.1 as u16,
             y: inner.y + (cursor.0 - first_row) as u16,
@@ -256,14 +264,14 @@ fn draw_list(buf: &mut Buffer, area: Rect, app: &mut App, theme: &Theme) {
     if height == 0 {
         return;
     }
-    let first = app.list_sel.saturating_sub(height - 1);
+    let first = app.list_sel.unwrap_or(0).saturating_sub(height - 1);
     let cwd_w = 26usize.min(w / 4);
     // cwd, " NN agents", " ttttt", "  $NN.NN"
     let right_w = cwd_w + 10 + 6 + 8;
     for (row, i) in (first..app.sessions.len()).take(height).enumerate() {
         let s = &app.sessions[i];
         let y = top + row as u16;
-        let selected = i == app.list_sel;
+        let selected = app.list_sel == Some(i);
         let full = Rect {
             x: area.x,
             y,
@@ -710,8 +718,11 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, theme: &Theme) {
     };
     buf.set_line(area.x, area.y, &left, area.width);
     let hint = match app.mode {
+        _ if app.screen == Screen::List && app.list_sel.is_some() => {
+            "↑↓ select · enter open · type to start a session · ctrl+x stop · del delete"
+        }
         _ if app.screen == Screen::List => {
-            "↑↓ select · enter open · ctrl+x stop · del delete · ctrl+c quit (sessions keep running)"
+            "enter start session · ↑ or esc back to the list · ctrl+c quit (sessions keep running)"
         }
         Mode::Navigate => "↑↓ select · enter expand · y copy · esc back",
         Mode::Help => "any key to close",
