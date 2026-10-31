@@ -144,5 +144,21 @@ async fn renders_a_session() {
     assert!(text.contains("Make the parser handle trailing commas"));
     assert!(text.contains("Edit(src/parse.rs)"));
     assert!(text.contains("Commit this with a short message"));
+
+    // The frozen view: ctrl+o, then up a few lines and start a selection.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    assert!(app.pager.is_some());
+    let _ = screen(&mut app, 120, 24);
+    for _ in 0..3 {
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+    }
+    app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+    let frozen = screen(&mut app, 120, 24);
+    println!("{frozen}");
+    assert!(frozen.contains("VISUAL"));
+    app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert!(app.pager.is_none());
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -39,6 +39,11 @@ pub fn short_model(model: &str) -> String {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let theme = app.theme;
+    app.screen_width = area.width;
+    if let Some(pager) = app.pager.as_mut() {
+        pager.draw(f.buffer_mut(), area, &theme);
+        return;
+    }
     if area.width < 20 || area.height < 8 {
         Paragraph::new("grove: window too small").render(area, f.buffer_mut());
         return;
@@ -547,7 +552,7 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         ("shift+enter · ctrl+j", "newline"),
         ("esc", "interrupt the focused agent"),
         ("ctrl+c", "clear input · interrupt · twice to quit"),
-        ("ctrl+o", "freeze: transcript to scrollback, select & copy"),
+        ("ctrl+o", "freeze: j/k ^d/^u gg/G / v y, mouse-select"),
         ("shift+tab", "cycle effort"),
         ("tab", "fill a suggested prompt (again: next one)"),
         ("ctrl+n · ctrl+p", "next · previous agent"),

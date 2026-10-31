@@ -8,6 +8,7 @@ use crossterm::event::{
 use ratatui::layout::Rect;
 
 use super::editor::Editor;
+use super::pager::{Pager, PagerAction};
 use super::theme::Theme;
 use super::transcript::Transcript;
 use crate::hub::Hub;
@@ -64,7 +65,10 @@ pub struct AgentView {
 
 pub enum Action {
     None,
+    /// The frozen view opened: release the mouse so the terminal can select text.
     Freeze,
+    /// It closed: take the mouse back.
+    Unfreeze,
     Redraw,
 }
 
@@ -99,6 +103,9 @@ pub struct App {
     pub hit: Hit,
     /// Text to put on the clipboard after the next draw.
     pub copy: Option<String>,
+    /// The frozen view (ctrl+o), when open.
+    pub pager: Option<Pager>,
+    pub screen_width: u16,
 }
 
 impl App {
@@ -124,7 +131,33 @@ impl App {
             transcript_height: 20,
             hit: Hit::default(),
             copy: None,
+            pager: None,
+            screen_width: 100,
         }
+    }
+
+    /// Freezes the focused transcript into a pager at full width.
+    fn open_pager(&mut self) -> bool {
+        let width = (self.screen_width as usize).saturating_sub(2).max(20);
+        let theme = self.theme;
+        let Some(view) = self.views.get_mut(self.focus) else {
+            return false;
+        };
+        let heights = view.transcript.layout(width, &theme);
+        let mut lines = Vec::new();
+        for i in 0..heights.len() {
+            for line in view.transcript.lines(i) {
+                lines.push(line.clone());
+            }
+            lines.push(ratatui::text::Line::default());
+        }
+        if lines.is_empty() {
+            self.toast(Level::Info, "nothing to freeze yet");
+            return false;
+        }
+        lines.pop();
+        self.pager = Some(Pager::new(&view.meta.id, lines));
+        true
     }
 
     pub fn focused(&self) -> Option<&AgentView> {
@@ -265,13 +298,33 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Action::None;
         }
+        // The frozen view takes every key while it's open.
+        if let Some(pager) = &mut self.pager {
+            return match pager.key(key) {
+                PagerAction::Close => {
+                    self.pager = None;
+                    Action::Unfreeze
+                }
+                PagerAction::Copy(text) => {
+                    self.copy = Some(text);
+                    Action::None
+                }
+                PagerAction::None => Action::None,
+            };
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         // Global keys.
         match key.code {
-            KeyCode::Char('o') if ctrl => return Action::Freeze,
+            KeyCode::Char('o') if ctrl => {
+                return if self.open_pager() {
+                    Action::Freeze
+                } else {
+                    Action::None
+                };
+            }
             KeyCode::Char('l') if ctrl => return Action::Redraw,
             KeyCode::Char('c') if ctrl => {
                 self.ctrl_c();

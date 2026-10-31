@@ -16,7 +16,7 @@ target/release/grove [prompt]  # -c to continue the last session here, -r <id> t
 | enter / shift+enter, ctrl+j | send / newline |
 | esc | interrupt the focused agent |
 | ctrl+c | clear input · interrupt · twice to quit |
-| **ctrl+o** | **freeze**: the transcript goes to the terminal's normal screen for native scrollback, selection, search and copy; agents keep running; ctrl+o / esc resumes |
+| **ctrl+o** | **freeze**: a still snapshot of the transcript while agents keep running. j/k line, ctrl+d/ctrl+u half page, ctrl+f/ctrl+b page, ctrl+e/ctrl+y scroll, gg/G, H/M/L, `/` search with n/N, `v` select lines + `y` copy; the mouse is released for native drag-select. q / esc / ctrl+o resumes |
 | shift+tab | cycle effort (low → max) |
 | tab | fill a suggested next prompt (again: the other one) |
 | ctrl+n / ctrl+p, alt+1…9, click | switch agent |
