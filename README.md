@@ -32,9 +32,9 @@ session: esc or ← on an empty prompt goes back to the list.
 | ctrl+n / ctrl+p, alt+1…9, click | switch agent |
 | shift+↑ or ctrl+g | browse the transcript: ↑↓ select, enter expand, y copy (OSC 52) |
 | pgup / pgdn / wheel | scroll (the view stays put while output arrives) |
-| ctrl+t | agents panel · `?` help · `/` commands |
+| `?` · `/` | help · commands (the header lists every agent; the focused one is highlighted) |
 
-Commands: `/clear /effort /model /spawn /interrupt /stop /retry /upgrade /improve /memory /supervisor /focus /cost /quit`.
+Commands: `/clear /effort /model /spawn /interrupt /stop /retry /upgrade /improve /memory /supervisor /focus /cost /sessions /rm /quit`.
 
 ## Architecture
 

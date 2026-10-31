@@ -33,7 +33,6 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/improve", "<idea> — ask the improver"),
     ("/memory", "<question> — ask the memory agent"),
     ("/supervisor", "<text> — talk to the supervisor"),
-    ("/agents", "toggle the agents panel"),
     ("/focus", "<agent> — switch to an agent"),
     ("/cost", "token usage and cost"),
     ("/sessions", "back to the session list"),
@@ -88,8 +87,6 @@ pub enum Action {
 /// Where things were drawn last frame, for mouse hit-testing.
 #[derive(Default)]
 pub struct Hit {
-    pub sidebar: Rect,
-    pub sidebar_rows: Vec<(u16, usize)>,
     pub transcript: Rect,
     /// Entry index for each transcript row on screen.
     pub rows: Vec<Option<usize>>,
@@ -128,7 +125,6 @@ pub struct App {
     hist_pos: Option<usize>,
     draft: String,
     pub mode: Mode,
-    pub sidebar: bool,
     pub menu_sel: usize,
     quit_armed: Option<Instant>,
     pub quit: bool,
@@ -171,7 +167,6 @@ impl App {
             hist_pos: None,
             draft: String::new(),
             mode: Mode::Input,
-            sidebar: true,
             menu_sel: 0,
             quit_armed: None,
             quit: false,
@@ -584,10 +579,6 @@ impl App {
             }
             KeyCode::Char('p') if ctrl => {
                 self.cycle_focus(-1);
-                return Action::None;
-            }
-            KeyCode::Char('t') if ctrl => {
-                self.sidebar = !self.sidebar;
                 return Action::None;
             }
             KeyCode::Char(c) if alt && c.is_ascii_digit() && c != '0' => {
@@ -1009,10 +1000,6 @@ impl App {
                     }
                 }
             }
-            "/agents" => {
-                self.sidebar = !self.sidebar;
-                Ok(())
-            }
             "/focus" => match self.views.iter().position(|v| v.meta.id == arg) {
                 Some(i) => {
                     self.set_focus(i);
@@ -1143,29 +1130,17 @@ impl App {
                     self.list_touched = true;
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) => {
-                if inside(self.hit.sidebar) {
-                    let mut target = None;
-                    for (row, i) in &self.hit.sidebar_rows {
-                        if *row == ev.row {
-                            target = Some(*i);
+            MouseEventKind::Down(MouseButton::Left) if inside(self.hit.transcript) => {
+                let row = (ev.row - self.hit.transcript.y) as usize;
+                if let Some(Some(entry)) = self.hit.rows.get(row).copied() {
+                    let focus = self.focus;
+                    if let Some(view) = self.views.get_mut(focus) {
+                        if view.selected == Some(entry) && self.mode == Mode::Navigate {
+                            view.transcript.toggle(entry);
                         }
+                        view.selected = Some(entry);
                     }
-                    if let Some(i) = target {
-                        self.set_focus(i);
-                    }
-                } else if inside(self.hit.transcript) {
-                    let row = (ev.row - self.hit.transcript.y) as usize;
-                    if let Some(Some(entry)) = self.hit.rows.get(row).copied() {
-                        let focus = self.focus;
-                        if let Some(view) = self.views.get_mut(focus) {
-                            if view.selected == Some(entry) && self.mode == Mode::Navigate {
-                                view.transcript.toggle(entry);
-                            }
-                            view.selected = Some(entry);
-                        }
-                        self.mode = Mode::Navigate;
-                    }
+                    self.mode = Mode::Navigate;
                 }
             }
             _ => {}

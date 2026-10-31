@@ -12,10 +12,9 @@ use unicode_width::UnicodeWidthStr;
 use super::app::{App, Mode, Screen};
 use super::theme::Theme;
 use super::wrap::line_width;
-use crate::protocol::{Level, Role, Status};
+use crate::protocol::{Level, Status};
 
 pub const SPINNER: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
-const SIDEBAR_W: u16 = 28;
 const MAX_INPUT_ROWS: usize = 10;
 
 pub fn short_model(model: &str) -> String {
@@ -76,7 +75,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if !in_session {
         draw_list(f.buffer_mut(), body, app, &theme);
     } else {
-        draw_session_body(f.buffer_mut(), body, area.width, app, &theme);
+        draw_session_body(f.buffer_mut(), body, app, &theme);
     }
     if busy {
         draw_activity(f.buffer_mut(), activity, app, &theme);
@@ -99,22 +98,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_session_body(buf: &mut Buffer, body: Rect, width: u16, app: &mut App, theme: &Theme) {
-    let show_sidebar = app.sidebar && width >= 90;
-    let (side, main) = if show_sidebar {
-        let [s, m] =
-            Layout::horizontal([Constraint::Length(SIDEBAR_W), Constraint::Min(20)]).areas(body);
-        (Some(s), m)
-    } else {
-        (None, body)
-    };
-    match side {
-        Some(s) => draw_sidebar(buf, s, app, theme),
-        None => {
-            app.hit.sidebar = Rect::default();
-            app.hit.sidebar_rows.clear();
-        }
-    }
+fn draw_session_body(buf: &mut Buffer, main: Rect, app: &mut App, theme: &Theme) {
     let transcript = Rect {
         x: main.x + 2,
         y: main.y,
@@ -356,32 +340,8 @@ fn clip_to(s: &str, width: usize) -> String {
 }
 
 fn draw_header(buf: &mut Buffer, area: Rect, app: &App, theme: &Theme) {
-    let left = match &app.session {
-        Some(info) => {
-            let mut spans = vec![
-                Span::styled(" grove", theme.accent().add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    format!("  {}", tilde(&info.cwd.display().to_string())),
-                    theme.muted(),
-                ),
-            ];
-            if let Some(t) = &info.title {
-                spans.push(Span::styled(
-                    format!("  · {}", clip_to(t, 40)),
-                    Style::new(),
-                ));
-            }
-            spans.push(Span::styled(format!("  · {}", info.id), theme.dim()));
-            Line::from(spans)
-        }
-        None => Line::from(vec![
-            Span::styled(" grove", theme.accent().add_modifier(Modifier::BOLD)),
-            Span::styled("  sessions", theme.muted()),
-        ]),
-    };
-    buf.set_line(area.x, area.y, &left, area.width);
-
-    // Watchers at a glance, and a pending self-upgrade.
+    // Right side first: a pending self-upgrade, then every agent (the focused one bright,
+    // a dot on unread). The left side gets whatever room is left.
     let mut spans = Vec::new();
     if let Some(summary) = &app.proposal {
         let short: String = summary.chars().take(40).collect();
@@ -390,18 +350,58 @@ fn draw_header(buf: &mut Buffer, area: Rect, app: &App, theme: &Theme) {
             Style::new().fg(theme.green),
         ));
     }
-    for v in &app.views {
-        if !v.meta.role.is_watcher() {
-            continue;
-        }
+    for (i, v) in app.views.iter().enumerate() {
         let (dot, style) = status_glyph(&v.status, app.spinner, theme);
         spans.push(Span::styled(dot, style));
-        spans.push(Span::styled(format!(" {}  ", v.meta.id), theme.dim()));
+        let name_style = if i == app.focus {
+            theme.accent().add_modifier(Modifier::BOLD)
+        } else {
+            theme.dim()
+        };
+        spans.push(Span::styled(format!(" {}", v.meta.id), name_style));
+        if v.unread {
+            spans.push(Span::styled("•", theme.accent()));
+        }
+        spans.push(Span::raw("  "));
     }
     let right = Line::from(spans);
-    let w = line_width(&right) as u16;
-    if w + 40 < area.width {
-        buf.set_line(area.x + area.width - w, area.y, &right, w);
+    let mut right_w = line_width(&right);
+    if right_w + 30 > area.width as usize {
+        right_w = 0;
+    }
+    let room = (area.width as usize).saturating_sub(right_w + 2);
+
+    let mut left = vec![Span::styled(
+        " grove",
+        theme.accent().add_modifier(Modifier::BOLD),
+    )];
+    match &app.session {
+        Some(info) => {
+            let cwd = format!("  {}", tilde(&info.cwd.display().to_string()));
+            let mut used = 6 + cwd.width();
+            left.push(Span::styled(cwd, theme.muted()));
+            if let Some(t) = &info.title {
+                let space = room.saturating_sub(used + 4).min(50);
+                if space >= 12 {
+                    let title = clip_to(t, space);
+                    used += 4 + title.width();
+                    left.push(Span::styled(format!("  · {title}"), Style::new()));
+                }
+            }
+            if used + 4 + info.id.len() <= room {
+                left.push(Span::styled(format!("  · {}", info.id), theme.dim()));
+            }
+        }
+        None => left.push(Span::styled("  sessions", theme.muted())),
+    }
+    buf.set_line(area.x, area.y, &Line::from(left), room as u16);
+    if right_w > 0 {
+        buf.set_line(
+            area.x + area.width - right_w as u16,
+            area.y,
+            &right,
+            right_w as u16,
+        );
     }
 }
 
@@ -416,111 +416,6 @@ fn status_glyph(status: &Status, spinner: usize, theme: &Theme) -> (String, Styl
         Status::Paused => ("‖".into(), Style::new().fg(theme.yellow)),
         Status::Stopped => ("■".into(), Style::new().fg(theme.red)),
         Status::Error(_) => ("✕".into(), Style::new().fg(theme.red)),
-    }
-}
-
-fn status_word(status: &Status) -> String {
-    match status {
-        Status::Thinking => "thinking".into(),
-        Status::Tools(n) => format!("tools {n}"),
-        Status::Idle => "idle".into(),
-        Status::Paused => "paused".into(),
-        Status::Stopped => "stopped".into(),
-        Status::Error(_) => "error".into(),
-    }
-}
-
-fn draw_sidebar(buf: &mut Buffer, area: Rect, app: &mut App, theme: &Theme) {
-    buf.set_style(area, Style::new().bg(theme.panel_bg));
-    app.hit.sidebar = area;
-    app.hit.sidebar_rows.clear();
-    let w = area.width.saturating_sub(1) as usize;
-    let mut y = area.y + 1;
-    buf.set_line(
-        area.x + 1,
-        y,
-        &Line::from(Span::styled(
-            "AGENTS",
-            theme.dim().add_modifier(Modifier::BOLD),
-        )),
-        area.width,
-    );
-    y += 2;
-    let mut watchers_started = false;
-    for i in 0..app.views.len() {
-        if y >= area.y + area.height {
-            break;
-        }
-        let v = &app.views[i];
-        if v.meta.role.is_watcher() && !watchers_started {
-            watchers_started = true;
-            y += 1;
-            if y >= area.y + area.height {
-                break;
-            }
-            buf.set_line(
-                area.x + 1,
-                y,
-                &Line::from(Span::styled(
-                    "WATCHERS",
-                    theme.dim().add_modifier(Modifier::BOLD),
-                )),
-                area.width,
-            );
-            y += 2;
-            if y >= area.y + area.height {
-                break;
-            }
-        }
-        let focused = i == app.focus;
-        let (glyph, gstyle) = status_glyph(&v.status, app.spinner, theme);
-        let indent = if v.meta.role == Role::Sub { "  " } else { "" };
-        let marker = if focused {
-            Span::styled("▌", theme.accent())
-        } else {
-            Span::raw(" ")
-        };
-        let name_style = if focused { theme.bold() } else { Style::new() };
-        let mut spans = vec![
-            marker,
-            Span::raw(indent),
-            Span::styled(glyph, gstyle),
-            Span::raw(" "),
-            Span::styled(v.meta.id.clone(), name_style),
-        ];
-        if v.unread {
-            spans.push(Span::styled(" •", theme.accent()));
-        }
-        let word = status_word(&v.status);
-        let left_w = line_width(&Line::from(spans.clone()));
-        let pad = w.saturating_sub(left_w + word.width() + 1);
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(word, theme.dim()));
-        let row_style = if focused {
-            Style::new().bg(theme.sel_bg)
-        } else {
-            Style::new()
-        };
-        let row = Rect {
-            x: area.x,
-            y,
-            width: area.width.saturating_sub(1),
-            height: 1,
-        };
-        buf.set_style(row, row_style);
-        buf.set_line(area.x, y, &Line::from(spans), area.width.saturating_sub(1));
-        app.hit.sidebar_rows.push((y, i));
-        y += 1;
-    }
-    // Hints at the bottom of the panel.
-    let hint_y = area.y + area.height.saturating_sub(2);
-    if hint_y > y {
-        buf.set_line(
-            area.x + 1,
-            hint_y,
-            &Line::from(Span::styled("ctrl+n/p switch", theme.dim())),
-            area.width,
-        );
     }
 }
 
@@ -751,7 +646,6 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         ("tab", "fill a suggested prompt (again: next one)"),
         ("ctrl+n · ctrl+p", "next · previous agent"),
         ("alt+1…9", "jump to agent"),
-        ("ctrl+t", "toggle agents panel"),
         ("shift+↑ · ctrl+g", "browse the transcript"),
         ("  ↑↓ enter y", "  select · expand · copy"),
         ("pgup · pgdn · wheel", "scroll"),
