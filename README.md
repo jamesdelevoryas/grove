@@ -53,8 +53,10 @@ Commands: `/clear /effort /model /spawn /interrupt /stop /retry /upgrade /improv
   - *supervisor*: sees prompts and tool calls within ~250 ms; can `interrupt_agent`,
     `stop_agent`, or send operator notes (delivered as mid-conversation `system`
     messages). It replaces permission prompts.
-  - *memory*: on each human prompt, searches the memory MCP server (memory.pjd.dev) and
-    sends useful notes to the working agent; saves durable facts.
+  - *memory*: on each human prompt, searches a memory MCP server and sends useful notes
+    to the working agent; saves durable facts. Off unless a server is configured:
+    `MEMORY_URL`, or `memory_url = https://…` in `~/.grove/config` (bearer token from the
+    keychain item `memory-mcp-token` or `MEMORY_TOKEN`).
   - *improver*: watches for friction, proposes fixes to grove itself, implements them
     on request, then `request_upgrade`.
 - **Self-upgrade** (`/upgrade`): the server runs `cargo build --release` while everything

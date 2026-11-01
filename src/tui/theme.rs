@@ -1,4 +1,4 @@
-//! Colours. Foregrounds use the terminal's own ANSI palette (James's anthropic-dark /
+//! Colours. Foregrounds use the terminal's own ANSI palette (e.g. anthropic-dark /
 //! anthropic-light Ghostty themes), so text always matches the terminal. Backgrounds are
 //! warm tints picked to sit on that palette's background at low contrast.
 

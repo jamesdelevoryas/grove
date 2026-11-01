@@ -1,4 +1,4 @@
-//! An MCP client over streamable HTTP (James's memory server). Adapted from Winter.
+//! An MCP client over streamable HTTP, used for the memory server.
 
 use std::collections::HashMap;
 

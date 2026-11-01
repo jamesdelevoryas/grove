@@ -28,6 +28,11 @@ fn meta(hub: &Hub, role: Role, name: &str, parent: Option<&str>) -> AgentMeta {
     )
 }
 
+/// A project path under $HOME, so it shows as ~/code/grove.
+fn project() -> String {
+    format!("{}/code/grove", std::env::var("HOME").unwrap_or_default())
+}
+
 pub fn screen(app: &mut App, w: u16, h: u16) -> String {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| view::draw(f, app)).unwrap();
@@ -47,17 +52,12 @@ async fn renders_a_session() {
     let dir = std::env::temp_dir().join(format!("grove-snap-{}", std::process::id()));
     let mut config = Config::load();
     config.home = dir.clone();
-    let store = Store::create(&dir, std::path::Path::new("/Users/peterd/code/grove")).unwrap();
+    let store = Store::create(&dir, std::path::Path::new(&project())).unwrap();
     let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
     let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
     let hub = Hub::new(config, store.clone(), api::Client::new(None), ui_tx, cmd_tx);
     let (remote, _requests) = Remote::detached();
-    let mut app = App::new(
-        remote,
-        Theme::dark(),
-        dir.clone(),
-        "/Users/peterd/code/grove".into(),
-    );
+    let mut app = App::new(remote, Theme::dark(), dir.clone(), project().into());
     let mut info = store.session.clone();
     info.title = Some("Make the parser handle trailing commas".into());
     app.on_reply(Reply::Attached { info });
@@ -88,7 +88,7 @@ async fn renders_a_session() {
         "main",
         EventKind::Injected {
             from: "memory".into(),
-            text: "James prefers plain for-loops over iterator chains (agent-code-style).".into(),
+            text: "The user prefers plain for-loops over iterator chains (code-style).".into(),
             directive: false,
         },
     ));
@@ -183,7 +183,7 @@ async fn renders_a_session() {
                cost: f64,
                mins: i64| SessionSummary {
         id: id.into(),
-        cwd: "/Users/peterd/code/grove".into(),
+        cwd: project().into(),
         created: now - chrono::Duration::minutes(mins),
         title: title.map(String::from),
         live,

@@ -46,7 +46,8 @@ options: --effort low|medium|high|xhigh|max   --model <id>
 Sessions run in a background server, so they keep going when you close the terminal.
 environment: ANTHROPIC_API_KEY (or keychain item grove-anthropic-api-key),
 GROVE_SUPERVISOR / GROVE_MEMORY / GROVE_IMPROVER = 0 to turn a watcher off,
-GROVE_THEME = light | dark, GROVE_SRC, GROVE_HOME, MEMORY_URL";
+GROVE_THEME = light | dark, GROVE_SRC, GROVE_HOME,
+MEMORY_URL (or memory_url = ... in ~/.grove/config) turns on the memory agent";
 
 enum Command {
     Ui(tui::Start),

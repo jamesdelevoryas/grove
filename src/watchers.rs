@@ -70,12 +70,15 @@ pub fn start(hub: &Hub, mut restored: Vec<(AgentMeta, Vec<Value>)>) {
         }
     }
 
-    if hub.config().memory {
+    // The memory agent needs a memory server to talk to; none is configured by default.
+    if hub.config().memory
+        && let Some(url) = hub.config().memory_url.clone()
+    {
         let saved = take_role(&mut restored, Role::Memory);
         let hub = hub.clone();
         // Connecting takes a moment; the memory agent starts once its tools exist.
         tokio::spawn(async move {
-            let mcp = match connect_memory(&hub).await {
+            let mcp = match connect_memory(&url).await {
                 Ok(mcp) => Arc::new(mcp),
                 Err(e) => {
                     let main = hub.find_role(Role::Main).unwrap_or_else(|| "main".into());
@@ -113,8 +116,9 @@ fn take_role(
     Some(restored.remove(i))
 }
 
-async fn connect_memory(hub: &Hub) -> anyhow::Result<Mcp> {
-    // A token of its own if James minted one for grove; else the Claude Code one.
+async fn connect_memory(url: &str) -> anyhow::Result<Mcp> {
+    // The bearer token: keychain memory-mcp-token (account "grove", then "claude-code"),
+    // else MEMORY_TOKEN.
     let token = match config::keychain("memory-mcp-token", Some("grove")) {
         Some(t) => t,
         None => match config::keychain("memory-mcp-token", Some("claude-code")) {
@@ -127,8 +131,7 @@ async fn connect_memory(hub: &Hub) -> anyhow::Result<Mcp> {
             },
         },
     };
-    let url = hub.config().memory_url.clone();
-    let connect = Mcp::connect("memory", &url, &token, MEMORY_TOOLS);
+    let connect = Mcp::connect("memory", url, &token, MEMORY_TOOLS);
     match tokio::time::timeout(Duration::from_secs(15), connect).await {
         Ok(result) => result,
         Err(_) => anyhow::bail!("timed out connecting to {url}"),

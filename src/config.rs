@@ -32,8 +32,6 @@ pub const WATCHER_RESET_INPUT_TOKENS: u64 = 120_000;
 pub const FRAME_MIN_MS: u64 = 8;
 pub const SPINNER_MS: u64 = 90;
 
-pub const MEMORY_URL: &str = "https://memory.pjd.dev/mcp";
-
 #[derive(Clone, Debug)]
 pub struct Config {
     pub model: String,
@@ -50,8 +48,9 @@ pub struct Config {
     pub home: PathBuf,
     /// GROVE_SRC: grove's own source tree, which the improver edits and /upgrade builds.
     pub src: PathBuf,
-    /// MEMORY_URL (the base URL; /mcp is appended if missing).
-    pub memory_url: String,
+    /// The memory MCP server: MEMORY_URL, else `memory_url` in ~/.grove/config. Without
+    /// one the memory agent doesn't run. (/mcp is appended if missing.)
+    pub memory_url: Option<String>,
     /// GROVE_THEME=light|dark; default: guessed from the Ghostty config, else dark.
     pub light_theme: bool,
 }
@@ -67,10 +66,18 @@ impl Config {
             Ok(dir) => PathBuf::from(dir),
             Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         };
-        let mut memory_url = std::env::var("MEMORY_URL").unwrap_or_else(|_| MEMORY_URL.into());
-        if !memory_url.trim_end_matches('/').ends_with("/mcp") {
-            memory_url = format!("{}/mcp", memory_url.trim_end_matches('/'));
-        }
+        let memory_url = match std::env::var("MEMORY_URL") {
+            Ok(url) if !url.trim().is_empty() => Some(url),
+            _ => file_setting(&home, "memory_url"),
+        };
+        let memory_url = memory_url.map(|url| {
+            let url = url.trim().trim_end_matches('/').to_string();
+            if url.ends_with("/mcp") {
+                url
+            } else {
+                format!("{url}/mcp")
+            }
+        });
         let effort = match std::env::var("GROVE_EFFORT") {
             Ok(e) => Effort::parse(&e).unwrap_or(DEFAULT_EFFORT),
             Err(_) => DEFAULT_EFFORT,
@@ -93,6 +100,27 @@ impl Config {
             light_theme,
         }
     }
+}
+
+/// A `key = value` line from ~/.grove/config (lines starting with # are comments).
+fn file_setting(home: &std::path::Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(home.join("config")).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() == key {
+            let v = v.trim().trim_matches('"');
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Unset or anything but "0"/"false"/"off" means on.
